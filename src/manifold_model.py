@@ -25,6 +25,7 @@ def make_loss_fn(static_model, manifold, sigma_fn):
 
         # Safely vmap over input
         score_pred = jax.vmap(lambda x_i, t_i: model(x_i, t_i))(xt, t)  # (B,D)
+        # score_pred = model(xt, t)
 
         loss = jnp.mean(jnp.sum((score_pred - target) ** 2, axis=-1))
         loss = jnp.where(jnp.isnan(loss), 1e6, loss)  # nan guard
@@ -46,7 +47,10 @@ def train(kind="sphere", geom_dim=2, steps=3000, B=64):
     params = eqx.filter(model, eqx.is_array)
     static = eqx.filter(model, lambda x: not eqx.is_array(x))
 
-    opt = optax.adam(1e-4)
+    opt = optax.chain(
+        optax.clip_by_global_norm(0.5),
+        optax.adam(5e-5),
+    )
     opt_state = opt.init(params)
 
     sigma_fn = lambda t: 0.2 + 1.5 * t
