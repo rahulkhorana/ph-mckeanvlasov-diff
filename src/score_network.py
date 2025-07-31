@@ -1,39 +1,53 @@
-import jax
-import jax.numpy as jnp
-import equinox as eqx
-from typing import Optional
+import jax, jax.numpy as jnp, equinox as eqx
+from typing import Optional, Sequence
+
+
+def sinusoidal_embed(t, dim):
+    freqs = jnp.exp(jnp.linspace(jnp.log(1e-4), jnp.log(1.0), dim // 2))
+    t = jnp.atleast_1d(t)  # ensure shape (B,) or (1,)
+    angles = t[:, None] * freqs[None, :]  # (B, dim//2)
+    embed = jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)  # (B, dim)
+    return embed.squeeze(0) if embed.shape[0] == 1 else embed
 
 
 class ScoreNet(eqx.Module):
-    mlp: eqx.nn.MLP
+    t_dim: int = eqx.field(static=True)
+    cond_dim: int = eqx.field(static=True)
+    embed_mlp: eqx.nn.MLP
 
-    def __init__(self, dim, cond_dim=0, width=128, depth=3, *, key):
-        # input size = manifold-dim  + 1 time-dim + optional condition dims
-        in_size = dim + 1 + cond_dim
-        self.mlp = eqx.nn.MLP(
+    def __init__(
+        self,
+        dim: int,
+        *,
+        t_dim: int = 32,
+        cond_dim: int = 0,
+        width: int = 128,
+        depth: int = 3,
+        key,
+    ):
+        self.t_dim = t_dim
+        self.cond_dim = cond_dim
+        in_size = dim + t_dim + cond_dim
+
+        self.embed_mlp = eqx.nn.MLP(
             in_size=in_size,
             out_size=dim,
             width_size=width,
             depth=depth,
             activation=jax.nn.silu,
+            use_bias=True,
             key=key,
         )
 
     def __call__(
         self, x: jnp.ndarray, t: jnp.ndarray, cond: Optional[jnp.ndarray] = None
     ) -> jnp.ndarray:
-        # x: (batch, dim), t: (batch,) or (batch,1)
-        if t.ndim == 1:
-            t = t[:, None]
-        if cond is not None:
-            input_vec = jnp.concatenate([x, t, cond], axis=-1)
+        if t.ndim == 2:
+            assert t.shape[1] == 1, f"t shape {t.shape} unexpected"
+            t = t[:, 0]
+        t_embed = sinusoidal_embed(t, self.t_dim)  # (B, t_dim)
+        if cond is None:
+            inp = jnp.concatenate([x, t_embed], axis=-1)  # (B, in_dim)
         else:
-            input_vec = jnp.concatenate([x, t], axis=-1)
-        # input_vec: (batch, in_size)
-
-        # Hand-vmap a single-call into self.mlp, so each example is mlp(iv)
-        def apply_one(iv):
-            return self.mlp(iv)  # iv: (in_size,), returns (dim,)
-
-        # Now map over axis 0
-        return jax.vmap(apply_one)(input_vec)
+            inp = jnp.concatenate([x, t_embed, cond], axis=-1)
+        return self.embed_mlp(inp)  # (B, dim)
