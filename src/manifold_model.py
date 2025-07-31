@@ -53,7 +53,7 @@ def train(kind="sphere", geom_dim=2, steps=3000, B=64):
     sigma_fn = lambda t: 0.2 + 1.5 * t
     loss_fn = make_loss_fn(static, manifold, sigma_fn)
 
-    @eqx.filter_jit
+    # @eqx.filter_jit
     def train_step(params, opt_state, x0, key):
         loss, grads = jax.value_and_grad(loss_fn)(params, x0, key)
         updates, opt_state = opt.update(grads, opt_state, params)
