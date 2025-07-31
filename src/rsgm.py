@@ -189,40 +189,97 @@ if __name__ == "__main__":
     ts = jnp.linspace(1.0, 1e-3, 100)
     key = jax.random.PRNGKey(42)
     xT = manifold.sample_wrapped_normal(64, key)
-    samples = sample_sde(model, xT, ts, manifold, key, sigma_fn=lambda t: 0.2 + 1.5 * t)
+    samples = sample_sde(
+        model,
+        xT,
+        ts,
+        manifold,
+        key,
+        sigma_fn=lambda t: jnp.clip(0.2 + 1.5 * t, 0.2, 2.0),
+    )
 
-    def project_to_3d(x):
-        # naive linear projection
-        return x[..., :3]  # pick first 3 dims
-
+    import numpy as np
+    from sklearn.decomposition import PCA
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # needed for 3D plots
 
-    def plot_sample_paths(samples, num_paths=5):
-        samples = jax.device_get(samples)  # convert from jax array
-        proj = project_to_3d(samples)  # shape (steps, batch, 3)
+    def plot_pca_3d(samples_4d):
+        # samples_4d: Array[T, B, 4]
+        final_samples = np.asarray(samples_4d)  # shape: (B, 4)
 
-        fig = plt.figure(figsize=(10, 8))
+        # Project to 3D using PCA
+        final_samples = samples_4d  # shape (B, D) → expected (num_samples, 4)
+        # Convert from JAX array if needed
+        if isinstance(samples_4d, jax.Array):
+            samples_4d = np.array(samples_4d)
+
+        # Use final timestep and flatten (B, N, D) → (B*N, D)
+        final_samples = samples_4d[-1].reshape(-1, samples_4d.shape[-1])  # (4096, 4)
+
+        # PCA to 3D
+        pca = PCA(n_components=3)
+        projected = pca.fit_transform(final_samples)
+
+        # Plot
+        fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
-
-        for i in range(num_paths):
-            path = proj[:, i, :]
-            ax.plot(path[:, 0], path[:, 1], path[:, 2], label=f"path {i}")
-
-        ax.set_title("Sample Paths (projected to 3D)")
-        ax.legend()
+        ax.scatter(
+            projected[:, 0], projected[:, 1], projected[:, 2], c="blue", alpha=0.6
+        )
+        ax.set_title("PCA of Final Sample Distribution (Flattened to 3D)")
         plt.tight_layout()
         plt.show()
 
-    def plot_final_samples(samples):
-        samples = jax.device_get(samples)
-        proj = project_to_3d(samples[-1])  # shape (batch, 3)
+    plot_pca_3d(samples)
 
-        fig = plt.figure(figsize=(6, 5))
+    def plot_3d_projection(samples):
+        """
+        Plot the final samples projected to 3D via axis selection.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if isinstance(samples, jax.Array):
+            samples = np.array(samples)
+
+        final_samples = samples[-1]  # shape: (B, N, 4)
+        flattened = final_samples.reshape(-1, 4)
+
+        fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(proj[:, 0], proj[:, 1], proj[:, 2], c="blue", alpha=0.5)
-        ax.set_title("Final Sample Distribution")
+
+        # Just plot first 3 dims: (x, y, z)
+        ax.scatter(
+            flattened[:, 0],
+            flattened[:, 1],
+            flattened[:, 2],
+            c="purple",
+            alpha=0.6,
+        )
+        ax.set_title("3D Projection of Final Samples (dims 0-1-2)")
+        plt.show()
+
+    plot_3d_projection(samples)
+
+    def plot_tsne(samples):
+        """
+        Flatten and project final samples with t-SNE into 2D.
+        """
+        import numpy as np
+        from sklearn.manifold import TSNE
+        import matplotlib.pyplot as plt
+
+        if isinstance(samples, jax.Array):
+            samples = np.array(samples)
+
+        final_samples = samples[-1].reshape(-1, samples.shape[-1])  # (B*N, 4)
+
+        tsne = TSNE(n_components=2, perplexity=30, learning_rate=100)
+        embedded = tsne.fit_transform(final_samples)
+
+        plt.scatter(embedded[:, 0], embedded[:, 1], c="green", s=3, alpha=0.7)
+        plt.title("t-SNE of Final Sample Distribution (2D)")
+        plt.axis("equal")
         plt.tight_layout()
         plt.show()
 
-    plot_final_samples(samples)
+    plot_tsne(samples)
