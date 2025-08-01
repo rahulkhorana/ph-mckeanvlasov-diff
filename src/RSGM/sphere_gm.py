@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib
 
-matplotlib.use("Agg")
+# matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 import os
@@ -10,6 +10,7 @@ import sys
 
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.append(str(Path(__file__).resolve().parent))
 
 # Import the corrected, unified components
 from score_match import ScoreNet, train, sample_sde
@@ -61,6 +62,10 @@ def visualize_on_sphere(
     ax.legend()
 
     # Save the figure to a file instead of showing it
+    # plt.show()
+    directory = os.path.dirname(filename)
+    if directory:  # Check if a directory path is part of the filename
+        os.makedirs(directory, exist_ok=True)
     plt.savefig(filename)
     print(f"Visualization saved to {filename}")
     plt.close(fig)  # Close the figure to free memory
@@ -84,7 +89,7 @@ def main():
     visualize_on_sphere(
         x0_viz,  # type: ignore
         title="Target Distribution (3D slice of S^3)",
-        filename="target_distribution.png",
+        filename="../plots/sphere_target_distribution.png",
     )
 
     # === 2. Initialize model ===
@@ -109,7 +114,7 @@ def main():
     visualize_on_sphere(
         samples,
         title="Generated Samples (3D slice of S^3)",
-        filename="generated_samples.png",
+        filename="../plots/sphere_generated_samples.png",
     )
 
     # CORRECTED: Add a clean exit to prevent segmentation fault during interpreter shutdown.

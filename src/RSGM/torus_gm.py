@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import matplotlib
 
 # Set the backend to 'Agg' to prevent interactive window errors (segfaults)
-matplotlib.use("Agg")
+# matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 import os
@@ -53,8 +53,11 @@ def visualize_on_3d_torus(
     ax.set_zlim(-jnp.pi, jnp.pi)  # type: ignore
     ax.set_box_aspect([1.0, 1.0, 1.0])  # type: ignore
     ax.legend()
-
+    # plt.show()
     # Save the figure to a file
+    directory = os.path.dirname(filename)
+    if directory:  # Check if a directory path is part of the filename
+        os.makedirs(directory, exist_ok=True)
     plt.savefig(filename)
     print(f"Visualization saved to {filename}")
     plt.close(fig)  # Close the figure to free memory
@@ -78,7 +81,7 @@ def main():
     visualize_on_3d_torus(
         x0_viz,  # type: ignore
         title="Target Distribution on T^3",
-        filename="target_distribution_torus3d.png",
+        filename="../plots/target_distribution_torus3d.png",
     )
 
     # === 2. Initialize model ===
@@ -103,7 +106,7 @@ def main():
     visualize_on_3d_torus(
         samples,
         title="Generated Samples on T^3",
-        filename="generated_samples_torus3d.png",
+        filename="../plots/generated_samples_torus3d.png",
     )
 
     # Use os._exit(0) for an immediate exit to prevent segfaults
