@@ -76,7 +76,7 @@ def main():
     print(f"--- Visualizing Target Distribution (T^3) ---")
     x0_viz = manifold.sample_wrapped_normal(2048, key=data_key)
     visualize_on_3d_torus(
-        x0_viz,
+        x0_viz,  # type: ignore
         title="Target Distribution on T^3",
         filename="target_distribution_torus3d.png",
     )

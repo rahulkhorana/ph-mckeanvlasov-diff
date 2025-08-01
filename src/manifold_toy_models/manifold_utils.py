@@ -27,13 +27,13 @@ class ManifoldWrapper:
         else:
             raise NotImplementedError(f"Unknown kind: {self.kind}")
 
-    def project(self, x: jnp.ndarray) -> jnp.ndarray:
+    def project(self, x: jnp.ndarray) -> jnp.ndarray | None:
         """Projects a point (or batch of points) onto the manifold."""
         if x.ndim == 1:
             return self._project_single(x)
         return jax.vmap(self._project_single)(x)
 
-    def _project_single(self, x: jnp.ndarray) -> jnp.ndarray:
+    def _project_single(self, x: jnp.ndarray) -> jnp.ndarray | None:
         """Projects a single point onto the manifold."""
         if self.kind == "sphere":
             norm = jnp.linalg.norm(x)
@@ -46,7 +46,7 @@ class ManifoldWrapper:
             v_scaled = v / jnp.maximum(jnp.linalg.norm(v), 1e-8) * self.r
             return jnp.pad(p_on_maj_circ, (0, 1)) + v_scaled
 
-    def project_to_tangent(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+    def project_to_tangent(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray | None:
         """Projects a vector v onto the tangent space at point x."""
         if self.kind == "sphere":
             # For a sphere, the normal is the normalized position vector.
@@ -61,13 +61,13 @@ class ManifoldWrapper:
             x_proj = self._project_single(x)
 
             # Now, calculate the tangent plane at the projected point, x_proj.
-            phi = jnp.arctan2(x_proj[1], x_proj[0])
-            xy_dist_from_origin = jnp.linalg.norm(x_proj[:2])
+            phi = jnp.arctan2(x_proj[1], x_proj[0])  # type: ignore
+            xy_dist_from_origin = jnp.linalg.norm(x_proj[:2])  # type: ignore
 
             # We need cos(theta) and sin(theta) for the derivative formulas.
             # Clip values to avoid numerical instability from projection errors.
             cos_theta = jnp.clip((xy_dist_from_origin - self.R) / self.r, -1.0, 1.0)
-            sin_theta = jnp.clip(x_proj[2] / self.r, -1.0, 1.0)
+            sin_theta = jnp.clip(x_proj[2] / self.r, -1.0, 1.0)  # type: ignore
 
             # The two orthogonal (but not yet unit) tangent vectors derived
             # from the partial derivatives of the torus's parametric equations.
@@ -97,12 +97,14 @@ class ManifoldWrapper:
             v_on_tangent = jnp.dot(v, e1) * e1 + jnp.dot(v, e2) * e2
             return v_on_tangent
 
-    def exp_map(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+    def exp_map(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray | None:
         """Approximates the exponential map by moving along the tangent vector v
         and then projecting back onto the manifold."""
         return self.project(x + v)
 
-    def sample_wrapped_normal(self, n: int, key, mu=None, std=0.4) -> jnp.ndarray:
+    def sample_wrapped_normal(
+        self, n: int, key, mu=None, std=0.4
+    ) -> jnp.ndarray | None:
         """
         Samples points from the manifold.
         - For a sphere, this samples from a wrapped normal distribution.
@@ -114,9 +116,9 @@ class ManifoldWrapper:
                 mu = jnp.zeros((self.embedded_dim,)).at[-1].set(1.0)  # North pole
             mu = self.project(mu)
             z = jax.random.normal(key, shape=(n, self.embedded_dim)) * std
-            mu_batched = jnp.broadcast_to(mu, (n, self.embedded_dim))
+            mu_batched = jnp.broadcast_to(mu, (n, self.embedded_dim))  # type: ignore
             v_proj = jax.vmap(self.project_to_tangent)(mu_batched, z)
-            return jax.vmap(self.exp_map)(mu_batched, v_proj)
+            return jax.vmap(self.exp_map)(mu_batched, v_proj)  # type: ignore
 
         elif self.kind == "torus":
             # Sample uniformly from the torus by sampling the underlying angles.
