@@ -66,22 +66,31 @@ class ManifoldWrapper:
         return x / jnp.where(norm < 1e-6, 1.0, norm)
 
     def sample_wrapped_normal(self, n, key, mu=None, std=1.0):
+        """
+        Samples from a wrapped normal distribution on the manifold.
+        """
         key_noise, _ = jax.random.split(key)
 
         if mu is None:
+            # Create a default base point if none is provided
             mu = jnp.zeros((self.embedded_dim,))
             if self.kind == "sphere":
+                # Default for sphere is the north pole
                 mu = mu.at[-1].set(1.0)
 
+        # Ensure the base point is on the manifold
         mu = self.project(mu)
+
+        # Sample noise from a standard normal distribution in the embedding space
         z = jax.random.normal(key_noise, shape=(n, self.embedded_dim)) * std
+
+        # Broadcast the base point to match the batch size of the noise
         mu_batched = jnp.broadcast_to(mu, (n, self.embedded_dim))
+
+        # Project the noise vectors onto the tangent space at each base point
         v_proj = jax.vmap(self.project_to_tangent)(mu_batched, z)
 
-        def exp_map_single(m, v):
-            norm = jnp.linalg.norm(v)
-            norm = jnp.where(norm < 1e-6, 1e-6, norm)
-            dir = v / norm
-            return self.project(jnp.cos(norm) * m + jnp.sin(norm) * dir)  # type: ignore
-
-        return jax.vmap(exp_map_single)(mu_batched, v_proj)
+        # Use the exponential map to transport the tangent vectors (noise)
+        # along the manifold from the base points. This correctly wraps the
+        # noise around the manifold's geometry.
+        return jax.vmap(self.exp_map)(mu_batched, v_proj)

@@ -82,7 +82,7 @@ def main():
     print(f"--- Visualizing Target Distribution (S^3 in R^4) ---")
     x0_viz = manifold.sample_wrapped_normal(1024, key=data_key)
     visualize_on_sphere(
-        x0_viz,
+        x0_viz,  # type: ignore
         title="Target Distribution (3D slice of S^3)",
         filename="target_distribution.png",
     )
