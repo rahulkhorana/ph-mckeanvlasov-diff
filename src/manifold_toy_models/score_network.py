@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import equinox as eqx
 from equinox.nn import MLP, Linear
 from typing import Callable, Any
-from manifold_utils import ManifoldWrapper
+from .manifold_utils import ManifoldWrapper
 
 
 def sinusoidal_embed(t, dim):

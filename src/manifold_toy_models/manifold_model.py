@@ -4,8 +4,8 @@ import optax
 import equinox as eqx
 from tqdm import trange
 
-from manifold_utils import ManifoldWrapper
-from manifold_toy_models.score_network import ScoreNet
+from .manifold_utils import ManifoldWrapper
+from .score_network import ScoreNet
 
 
 def make_loss_fn(static_model, manifold, sigma_fn):
