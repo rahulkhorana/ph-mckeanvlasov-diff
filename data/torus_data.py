@@ -126,7 +126,7 @@ class TorusDataset(Dataset):
 
 
 def main():
-    tor = TorusData(10, 300)
+    tor = TorusData(10, 200)
     dataset = tor.generate_dataset()
     torch.save(dataset, "torus_data.pt")
 

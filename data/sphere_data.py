@@ -149,7 +149,7 @@ class SphereDataset(Dataset):
 
 
 def main():
-    spherz = SphereData(5, 500)
+    spherz = SphereData(5, 200)
     dataset = spherz.generate_dataset()
     torch.save(dataset, "sphere_data.pt")
 

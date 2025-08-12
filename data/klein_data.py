@@ -167,7 +167,7 @@ class KleinDataset(Dataset):
 
 
 def main():
-    kleyn = KleinData(5, 500)
+    kleyn = KleinData(5, 200)
     dataset = kleyn.generate_dataset()
     torch.save(dataset, "klein_data.pt")
 

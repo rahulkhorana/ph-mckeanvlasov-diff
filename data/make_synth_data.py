@@ -1,4 +1,5 @@
 import os
+import platform
 
 # --- Threading controls before heavy imports ---
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -8,9 +9,28 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 # IMPORTANT: Disable KeOps's use of OpenMP to prevent multiprocessing crashes on macOS
 os.environ.setdefault("KEOPS_OMP", "0")
 
+# --- Apple Silicon / libomp wiring ---
+if platform.system() == "Darwin" and platform.machine() == "arm64":
+    os.environ.setdefault("HOMEBREW_PREFIX", "/opt/homebrew")
+    hb = os.environ["HOMEBREW_PREFIX"]
+    os.environ.setdefault("CC", "clang")
+    os.environ.setdefault("CXX", "clang++")
+    cflags = f"-O3 -fopenmp -I{hb}/opt/libomp/include"
+    ldflags = f"-L{hb}/opt/libomp/lib -lomp"
+    os.environ["CFLAGS"] = f"{cflags} " + os.environ.get("CFLAGS", "")
+    os.environ["CXXFLAGS"] = f"{cflags} " + os.environ.get("CXXFLAGS", "")
+    os.environ["LDFLAGS"] = f"{ldflags} " + os.environ.get("LDFLAGS", "")
+    os.environ["DYLD_LIBRARY_PATH"] = f"{hb}/opt/libomp/lib:" + os.environ.get(
+        "DYLD_LIBRARY_PATH", ""
+    )
+
+# If you keep seeing duplicate OpenMP runtime errors, uncomment:
+# os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import uuid
 import math
 import tempfile
+import shutil
 from typing import List, Tuple
 
 import numpy as np
@@ -21,6 +41,27 @@ from tqdm import tqdm
 
 import multipers as mpers
 from multipers.filtrations import RipsCodensity
+
+# Force KeOps to use a shared cache folder to avoid race conditions across workers
+os.environ.setdefault("PYKEOPS_CACHE_DIR", os.path.join(os.getcwd(), ".keops_cache"))
+os.makedirs(os.environ["PYKEOPS_CACHE_DIR"], exist_ok=True)
+
+# ---------------- Configuration ----------------
+TARGET_DIMENSION = 6
+TOTAL_POINTS = int(os.getenv("TOTAL_POINTS", "1000"))
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "9"))
+CHUNKSIZE = int(os.getenv("CHUNKSIZE", "8"))
+MAXTASKSPERCHILD = int(os.getenv("MAXTASKSPERCHILD", "50"))
+KEEP_MODULES = os.getenv("KEEP_MODULES", "0") == "1"
+LANDSCAPE_RES = int(os.getenv("LANDSCAPE_RES", "64"))
+KS_MAX = int(os.getenv("KS_MAX", "2"))
+OUT_DIR = os.getenv("OUT_DIR", os.path.join(os.getcwd(), "tmp_samples"))
+FINAL_DATASET = os.getenv("FINAL_DATASET", "unified_topological_data_v6_semifast.pt")
+
+SEED = os.getenv("SEED")
+if SEED is not None:
+    np.random.seed(int(SEED))
+    torch.manual_seed(int(SEED))
 
 # ---------------- Configuration ----------------
 TARGET_DIMENSION = 6
@@ -219,6 +260,7 @@ def generate_datapoint(args):
             spread=np.random.uniform(0.1, 10),
             bump=False,
         )
+        X = X[:n_points]
     elif specific_label == "sphere_pack_bumpy":
         X = sample_sphere_pack(
             n_spheres=3,
@@ -226,6 +268,7 @@ def generate_datapoint(args):
             spread=np.random.uniform(0.1, 10),
             bump=True,
         )
+        X = X[:n_points]
     elif specific_label == "torus_3d":
         X = sample_3_torus(
             n=n_points,
@@ -293,6 +336,16 @@ class OnDiskTopologicalDataset(Dataset):
 # ---------------- Main ----------------
 
 
+def _prewarm_keops():
+    """Compile KeOps kernels once in the parent so workers only load from cache."""
+    try:
+        X = np.random.randn(32, TARGET_DIMENSION).astype(np.float32)
+        # Use same expansion + landscape config to ensure identical kernel signature
+        _ = compute_mods_and_landscapes(X, expansion_dim=2)
+    except Exception as e:
+        print(f"[Prewarm] KeOps pre-compilation failed: {e}")
+
+
 def main():
     torch.set_num_threads(1)  # keep per-process BLAS single-threaded
 
@@ -320,6 +373,10 @@ def main():
 
     ctx = mp.get_context("spawn")
     saved_paths, saved_labels = [], []
+
+    # Pre-compile KeOps kernels in the parent to avoid per-worker races and ModuleNotFoundError
+    _prewarm_keops()
+
     try:
         with ctx.Pool(processes=NUM_WORKERS, maxtasksperchild=MAXTASKSPERCHILD) as pool:
             for rec in tqdm(
@@ -333,37 +390,68 @@ def main():
         print("\nInterrupted; shutting down workers...")
         raise
 
-    # Write lightweight index
+    # Write lightweight index (kept only for debugging)
     index = {"paths": saved_paths, "labels": saved_labels, "label_map": label_map}
     index_file = os.path.join(os.getcwd(), "unified_topological_index.pt")
     torch.save(index, index_file)
 
-    # Also optionally pack all items into one file without loading everything at once
-    # (still on-disk streaming)
-    print("Packing consolidated dataset file (streaming)...")
-    ds = OnDiskTopologicalDataset(index_file)
+    # -------- Final single-file pack (loads sequentially, then saves one .pt) --------
+    print("Packing final single .pt (this may take a moment)…")
+    pcs, ys, lands, mods = [], [], [], []
+    keep_modules_local = KEEP_MODULES
 
-    # We will not materialize everything; we just keep paths+labels+map.
-    torch.save(
-        {
-            "index_file": index_file,
-            "label_map": label_map,
-            "paths": saved_paths,
-            "labels": saved_labels,
+    for pth, lab in tqdm(
+        zip(saved_paths, saved_labels), total=len(saved_paths), desc="Packing"
+    ):
+        rec = torch.load(pth, map_location="cpu")
+        pcs.append(rec["pc"])  # (100, 6) float16
+        ys.append(int(rec["y"]))  # int
+        lands.append(rec["landscapes"])  # (3, KS_MAX, RES, RES) float16
+        if keep_modules_local:
+            mods.append(rec["modules"])  # may be None or list
+
+    pcs = torch.stack(pcs, dim=0)  # (N, 100, 6)
+    ys = torch.tensor(ys, dtype=torch.long)  # (N,)
+    lands = torch.stack(lands, dim=0)  # (N, 3, KS_MAX, RES, RES)
+
+    payload = {
+        "pcs": pcs,
+        "labels": ys,
+        "landscapes": lands,
+        "modules": mods if keep_modules_local else None,
+        "label_map": label_map,
+        "meta": {
+            "target_dim": TARGET_DIMENSION,
+            "ks_max": KS_MAX,
+            "landscape_res": LANDSCAPE_RES,
+            "keep_modules": keep_modules_local,
         },
-        FINAL_DATASET,
+    }
+
+    torch.save(payload, FINAL_DATASET)
+
+    print(f"Wrote FINAL packed dataset → {FINAL_DATASET}")
+    print(
+        f"Shapes: pcs={tuple(pcs.shape)}, labels={tuple(ys.shape)}, landscapes={tuple(lands.shape)}"
     )
 
-    print(f"\nWrote index → {index_file}")
-    print(f"Wrote consolidated metadata → {FINAL_DATASET}")
-    print(f"Total items: {len(saved_paths)}")
+    # -------- Cleanup temp shards --------
+    try:
+        for p in saved_paths:
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+        # remove the temp directory if empty; else nuke recursively
+        try:
+            os.rmdir(OUT_DIR)
+        except OSError:
+            shutil.rmtree(OUT_DIR, ignore_errors=True)
+        print("Deleted temporary shard files.")
+    except Exception as e:
+        print(f"[Cleanup] Could not remove temp files: {e}")
 
-    # Quick sanity peek
-    if saved_paths:
-        sample = torch.load(saved_paths[0], map_location="cpu")
-        print(
-            f"First item - Object shape: {tuple(sample['pc'].shape)}, Label: {sample['y']} ({label_map[sample['y']]})"
-        )
+    print(f"Total items: {len(saved_paths)}")
 
 
 if __name__ == "__main__":
