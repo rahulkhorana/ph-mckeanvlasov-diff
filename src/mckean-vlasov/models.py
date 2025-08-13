@@ -25,44 +25,64 @@ class TinyUNet(nn.Module):
     ch: int = 64
 
     def _inject(self, h, te):
-        b, hH, hW, c = h.shape
-        te_proj = nn.Dense(c)(te)  # (B, c)
-        return h + te_proj[:, None, None, :]  # broadcast
+        """
+        h: (..., H, W, C)
+        te: (B, D)   (B is the leading batch dim of h)
+        Broadcast a per-sample time embedding across spatial dims.
+        """
+        # last dim is channels always
+        C = h.shape[-1]
+        B = te.shape[0]
+        te_proj = nn.Dense(C)(te)  # (B, C)
+
+        # Build a shape like (B, 1, 1, C) for any rank >= 3
+        # If h has rank R, we want (B, 1, ..., 1, C) with (R-2) ones in the middle
+        expand = (B,) + (1,) * (h.ndim - 2) + (C,)
+        te_b = jnp.reshape(te_proj, expand)  # broadcastable to h
+        return h + te_b
 
     def _match_hw(self, x, ref):
-        """Center-crop/pad x to match ref's H,W."""
-        H, W = ref.shape[1], ref.shape[2]
-        h, w = x.shape[1], x.shape[2]
+        """Center-crop/pad x to match ref's spatial shape on the last two axes (H,W)."""
+        H_ref, W_ref = int(ref.shape[-3]), int(ref.shape[-2])  # NHWC -> indices -3,-2
+        H, W = int(x.shape[-3]), int(x.shape[-2])
 
         # crop if larger
-        if h > H:
-            dh = h - H
-            top = dh // 2
-            x = x[:, top : top + H, :, :]
-        if w > W:
-            dw = w - W
-            left = dw // 2
-            x = x[:, :, left : left + W, :]
+        if H > H_ref:
+            dH = H - H_ref
+            top = dH // 2
+            x = x[..., top : top + H_ref, :, :]
+        if W > W_ref:
+            dW = W - W_ref
+            left = dW // 2
+            x = x[..., :, left : left + W_ref, :]
 
         # pad if smaller
-        h, w = x.shape[1], x.shape[2]
-        if h < H or w < W:
-            pad_h = max(0, H - h)
-            pad_w = max(0, W - w)
+        H, W = int(x.shape[-3]), int(x.shape[-2])
+        if H < H_ref or W < W_ref:
+            pad_h = max(0, H_ref - H)
+            pad_w = max(0, W_ref - W)
             pad_top = pad_h // 2
             pad_bottom = pad_h - pad_top
             pad_left = pad_w // 2
             pad_right = pad_w - pad_left
-            x = jnp.pad(
-                x,
-                ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
-                mode="constant",
+            pads = ((0, 0),)  # batch (or leading) dims – will expand later
+            # Build full pad spec for arbitrary rank NHWC:
+            # leading dims (if any): zeros
+            lead = [(0, 0)] * (x.ndim - 4)
+            pad_spec = (
+                *lead,
+                (pad_top, pad_bottom),  # H
+                (pad_left, pad_right),  # W
+                (0, 0),  # C
             )
+            x = jnp.pad(x, pad_spec, mode="constant")
         return x
 
     @nn.compact
     def __call__(self, x, t_embed):
-        # time mlp
+        # Optional sanity: enforce NHWC rank>=4
+        # assert x.ndim >= 4, f"UNet expects NHWC-ish input, got shape {x.shape}"
+
         te = nn.relu(nn.Dense(self.ch)(t_embed))
         te = nn.relu(nn.Dense(self.ch)(te))
 
@@ -362,21 +382,32 @@ class ModulesTrajectoryEncoder(nn.Module):
 
 
 class EnergyNetwork(nn.Module):
-    """E_phi(L, M): takes image L and M-embedding; outputs scalar energy per sample."""
+    """E_phi(L, M): takes image L (B,H,W,C) and M-embedding (B,d) -> scalar per sample."""
 
     ch: int = 64
     m_dim: int = 256
 
     @nn.compact
     def __call__(self, L, m_emb):
-        # L: (B,H,W,C)
+        # Expect NHWC (B,H,W,C)
+        assert L.ndim >= 4, f"EnergyNetwork expects NHWC input, got {L.shape}"
+
         h = ResBlock(self.ch)(L)
-        h = nn.max_pool(h, (2, 2))
+        h = nn.max_pool(h, (2, 2), strides=(2, 2), padding="SAME")
         h = ResBlock(self.ch * 2)(h)
-        h = nn.max_pool(h, (2, 2))
-        h = ResBlock(self.ch * 4)(h)
-        h = jnp.mean(h, axis=(1, 2))  # global avg pool -> (B, ch*4)
-        joint = jnp.concatenate([h, m_emb], axis=-1)
+        h = nn.max_pool(h, (2, 2), strides=(2, 2), padding="SAME")
+        h = ResBlock(self.ch * 4)(h)  # (B, H', W', C')
+
+        # Global average over all spatial axes (everything except batch & channels)
+        spatial_axes = tuple(range(1, h.ndim - 1))  # e.g. (1, 2) for 2D images
+        h = jnp.mean(h, axis=spatial_axes)  # -> (B, C')
+
+        # Ensure m_emb is (B, d)
+        assert (
+            m_emb.ndim == 2 and m_emb.shape[0] == h.shape[0]
+        ), f"m_emb must be (B,d), got {m_emb.shape}"
+
+        joint = jnp.concatenate([h, m_emb], axis=-1)  # (B, C'+d)
         e = nn.Dense(256)(joint)
         e = nn.tanh(e)
         e = nn.Dense(1)(e)
