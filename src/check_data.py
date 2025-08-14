@@ -6,7 +6,7 @@ from mpl_toolkits.mplot3d import Axes3D
 
 DATA_PATH = "../datasets/unified_topological_data_v6_semifast.pt"
 OUT_DIR = "dataset_3d_surfaces"
-SAMPLE_ID = 2  # which item in the dataset
+SAMPLE_ID = 4  # which item in the dataset
 CLIP_PCT = 0.5  # percentile clipping for nicer contrast (0 = off)
 
 os.makedirs(OUT_DIR, exist_ok=True)
