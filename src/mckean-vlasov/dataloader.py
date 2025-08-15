@@ -1,183 +1,113 @@
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
-
+from typing import Dict, Any, Iterator, Optional, Tuple
 import numpy as np
 import torch
 
 
-@dataclass(frozen=True)
 class PackedDataset:
-    pcs: np.ndarray  # (N, 100, 6) float32
-    labels: np.ndarray  # (N,) int64
-    lands: np.ndarray  # (N, H, W, C) float32  with C = 3*KS
-    modules: List[Any]  # length N, ragged per-sample structure (REQUIRED)
-    label_map: Dict[int, str]
-    meta: Dict[str, Any]
-    KS: int  # original KS dimension for landscapes
+    """Simple container to hold numpy arrays for JAX."""
+
+    def __init__(self, lands_vol: np.ndarray, modules, meta: Dict[str, Any]):
+        # lands_vol: (N,H,W,K,3) float32
+        self.lands = lands_vol
+        self.modules = modules
+        self.meta = meta
 
     @property
-    def N(self) -> int:
-        return int(self.pcs.shape[0])
+    def N(self):
+        return self.lands.shape[0]
 
-    def get_item(self, i: int) -> Dict[str, Any]:
+    def __len__(self):
+        return int(self.lands.shape[0])
+
+    def __getitem__(self, idx):
         return {
-            "pc": self.pcs[i],  # (100, 6) float32
-            "label": int(self.labels[i]),
-            "landscapes": self.lands[i],  # (H, W, C) float32
-            "modules": self.modules[i],  # ragged
+            "lands": self.lands[idx],
+            "modules": self.modules[idx],
+            "meta": None if self.meta is None else self.meta[idx],
         }
 
 
-def load_packed_pt(
-    path: str,
-    require_modules: bool = True,
-    cast_float32: bool = True,
-) -> PackedDataset:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Packed dataset not found: {path}")
+def _to_volume(lands_t: torch.Tensor) -> Tuple[np.ndarray, int]:
+    """
+    Input torch tensor: (N, 3, KS, H, W) float16 from your pack.
+    Returns float32 numpy: (N, H, W, KS, 3) and KS.
+    """
+    assert (
+        lands_t.ndim == 5 and lands_t.shape[1] == 3
+    ), f"bad landscapes shape {tuple(lands_t.shape)}"
+    N, D, KS, H, W = lands_t.shape
+    # -> (N, H, W, 3, KS)
+    lands = lands_t.permute(0, 3, 4, 1, 2).contiguous().float().cpu().numpy()
+    # -> (N, H, W, KS, 3)
+    lands = np.transpose(lands, (0, 1, 2, 4, 3)).astype(np.float32)
+    return lands, KS
 
-    data = torch.load(path, map_location="cpu")
 
-    # Required keys
-    for k in ("pcs", "labels", "landscapes", "modules", "label_map", "meta"):
-        if k not in data:
-            raise KeyError(f"Packed file missing key: '{k}'")
+def load_packed_pt(path: str, require_modules: bool = True) -> Dict[str, Any]:
+    pack = torch.load(path, map_location="cpu")
+    keys = list(pack.keys())
+    assert (
+        "landscapes" in keys and "modules" in keys and "meta" in keys
+    ), f"missing keys {keys}"
+    lands, KS = _to_volume(pack["landscapes"])
+    modules = pack["modules"]
+    if require_modules:
+        assert (
+            isinstance(modules, list) and len(modules) == lands.shape[0]
+        ), "modules not present per-sample"
+    meta = dict(pack["meta"])
+    meta["KS"] = KS
+    return {"lands_vol": lands, "modules": modules, "meta": meta}
 
-    pcs = data["pcs"]  # (N, 100, 6) torch.Tensor (fp16)
-    labels = data["labels"]  # (N,) torch.Tensor (long)
-    lands = data["landscapes"]  # (N, 3, KS, RES, RES) torch.Tensor (fp16)
-    modules = data["modules"]  # list or None
-    label_map = data["label_map"]
-    meta = data["meta"]
 
-    if require_modules and modules is None:
-        raise ValueError(
-            "modules=None in packed file, but require_modules=True. "
-            "Regenerate with KEEP_MODULES=1."
-        )
-
-    # Convert to NumPy
-    pcs_np = pcs.numpy() if pcs.device.type == "cpu" else pcs.cpu().numpy()
-    labels_np = labels.numpy().astype(np.int64)
-    lands_np = lands.numpy() if lands.device.type == "cpu" else lands.cpu().numpy()
-
-    # Cast to float32 (safer for JAX & training)
-    if cast_float32:
-        pcs_np = pcs_np.astype(np.float32, copy=False)
-        lands_np = lands_np.astype(np.float32, copy=False)
-
-    # Reshape landscapes to NHWC: (N, H, W, C) with C = 3*KS
-    if lands_np.ndim != 5:
-        raise ValueError(f"landscapes expected (N,3,KS,H,W); got {lands_np.shape}")
-    N, D, KS, H, W = lands_np.shape
-    if D != 3:
-        raise ValueError(
-            f"First dim of landscapes must be 3 (degrees H0,H1,H2); got {D}"
-        )
-    lands_np = lands_np.reshape(N, D * KS, H, W)  # (N, C, H, W)
-    lands_np = np.transpose(lands_np, (0, 2, 3, 1))  # (N, H, W, C)
-
-    # Basic integrity checks
-    if pcs_np.shape[0] != N or labels_np.shape[0] != N or len(modules) != N:
-        raise ValueError("Inconsistent N across pcs/labels/landscapes/modules")
-
-    return PackedDataset(
-        pcs=pcs_np,
-        labels=labels_np,
-        lands=lands_np,
-        modules=list(modules) if modules is not None else [None] * N,
-        label_map=label_map,
-        meta=meta,
-        KS=KS,
+def describe(p) -> str:
+    lands = p["lands_vol"]
+    meta = p["meta"]
+    return (
+        f"N={lands.shape[0]}  vol=(N,H,W,K,C)={lands.shape}  "
+        f"KS={meta.get('KS')}  degrees=3  res={meta.get('landscape_res')}"
     )
 
 
 def train_val_split(
-    ds: PackedDataset,
-    val_frac: float = 0.1,
-    seed: int = 0,
-    stratify: bool = True,
+    packed: Dict[str, Any], val_frac=0.1, seed=0
 ) -> Tuple[PackedDataset, PackedDataset]:
-    """
-    Deterministic split. If stratify=True, preserve label proportions.
-    """
     rng = np.random.RandomState(seed)
-    N = ds.N
+    N = packed["lands_vol"].shape[0]
     idx = np.arange(N)
+    rng.shuffle(idx)
+    nv = max(1, int(val_frac * N))
+    val_idx = idx[:nv]
+    tr_idx = idx[nv:]
 
-    if stratify:
-        # group by label and split inside each
-        labels = ds.labels
-        train_idx, val_idx = [], []
-        for y in np.unique(labels):
-            grp = idx[labels == y]
-            rng.shuffle(grp)
-            k = int(round(val_frac * len(grp)))
-            val_idx.append(grp[:k])
-            train_idx.append(grp[k:])
-        train_idx = np.concatenate(train_idx) if train_idx else np.array([], dtype=int)
-        val_idx = np.concatenate(val_idx) if val_idx else np.array([], dtype=int)
-    else:
-        rng.shuffle(idx)
-        k = int(round(val_frac * N))
-        val_idx, train_idx = idx[:k], idx[k:]
+    def sel(arr):
+        return arr[tr_idx], arr[val_idx]
 
-    def _slice(ds: PackedDataset, sel: np.ndarray) -> PackedDataset:
-        return PackedDataset(
-            pcs=ds.pcs[sel],
-            labels=ds.labels[sel],
-            lands=ds.lands[sel],
-            modules=[ds.modules[i] for i in sel],
-            label_map=ds.label_map,
-            meta=ds.meta,
-            KS=ds.KS,
-        )
-
-    return _slice(ds, train_idx), _slice(ds, val_idx)
+    lands_tr, lands_val = sel(packed["lands_vol"])
+    mods_tr = [packed["modules"][i] for i in tr_idx]
+    mods_val = [packed["modules"][i] for i in val_idx]
+    meta = packed["meta"]
+    return PackedDataset(lands_tr, mods_tr, meta), PackedDataset(
+        lands_val, mods_val, meta
+    )
 
 
 def iterate_batches(
     ds: PackedDataset,
     batch_size: int,
-    shuffle: bool = True,
-    drop_last: bool = False,
-    seed: int = 0,
-    epochs: Optional[int] = None,  # None = infinite
+    shuffle=True,
+    seed=0,
+    epochs: Optional[int] = None,
 ) -> Iterator[Dict[str, Any]]:
-    """
-    Deterministic epoch-based iterator. Yields dicts with:
-      'lands': (B,H,W,C) float32
-      'modules': list length B (ragged)
-      (you can add 'pcs'/'labels' here if needed)
-    """
-    N = ds.N
     rng = np.random.RandomState(seed)
-    epoch = 0
-    while epochs is None or epoch < epochs:
+    N = ds.N
+    ep = 0
+    while epochs is None or ep < epochs:
         order = np.arange(N)
         if shuffle:
             rng.shuffle(order)
-
-        for start in range(0, N, batch_size):
-            end = start + batch_size
-            if end > N and drop_last:
-                break
-            sel = order[start:end]
-            yield {
-                "lands": ds.lands[sel],
-                "modules": [ds.modules[i] for i in sel],
-                # uncomment if you need them in-batch:
-                # "pcs": ds.pcs[sel],
-                # "labels": ds.labels[sel],
-            }
-        epoch += 1
-
-
-def describe(ds: PackedDataset) -> str:
-    N, H, W, C = ds.lands.shape
-    return (
-        f"N={ds.N}  pcs={ds.pcs.shape}  lands={ds.lands.shape}  "
-        f"labels={ds.labels.shape}  KS={ds.KS}  C=3*KS={3*ds.KS}  "
-        f"modules_len={len(ds.modules)}"
-    )
+        for s in range(0, N, batch_size):
+            idx = order[s : s + batch_size]
+            yield {"lands": ds.lands[idx], "modules": [ds.modules[i] for i in idx]}
+        ep += 1

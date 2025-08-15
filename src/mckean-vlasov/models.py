@@ -1,7 +1,8 @@
+from typing import Any, List, Optional, Tuple
 import numpy as np
+import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import List, Any, Tuple
 from flax.linen import attention as nn_attn
 
 
@@ -21,98 +22,202 @@ class ResBlock(nn.Module):
         return x + h
 
 
-class TinyUNet(nn.Module):
-    ch: int = 64
+# ---------- Embeddings ----------
 
-    def _inject(self, h, te):
-        """
-        h: (..., H, W, C)
-        te: (B, D)   (B is the leading batch dim of h)
-        Broadcast a per-sample time embedding across spatial dims.
-        """
-        # last dim is channels always
-        C = h.shape[-1]
-        B = te.shape[0]
-        te_proj = nn.Dense(C)(te)  # (B, C)
 
-        # Build a shape like (B, 1, 1, C) for any rank >= 3
-        # If h has rank R, we want (B, 1, ..., 1, C) with (R-2) ones in the middle
-        expand = (B,) + (1,) * (h.ndim - 2) + (C,)
-        te_b = jnp.reshape(te_proj, expand)  # broadcastable to h
-        return h + te_b
+def time_embed(t: jnp.ndarray, dim: int = 128) -> jnp.ndarray:
+    """Sin-cos positional embedding. Pure (no nn.Dense), so no init/apply hassles.
+    t: (B,) float in [0,1] or int timesteps; returns (B, dim)
+    """
+    t = t.astype(jnp.float32)
+    half = dim // 2
+    freqs = jnp.exp(jnp.linspace(np.log(1.0), np.log(10000.0), half))
+    angles = t[:, None] * freqs[None, :]
+    emb = jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
+    if dim % 2:  # odd dim, pad
+        emb = jnp.pad(emb, ((0, 0), (0, 1)))
+    return emb
 
-    def _match_hw(self, x, ref):
-        """Center-crop/pad x to match ref's spatial shape on the last two axes (H,W)."""
-        H_ref, W_ref = int(ref.shape[-3]), int(ref.shape[-2])  # NHWC -> indices -3,-2
-        H, W = int(x.shape[-3]), int(x.shape[-2])
 
-        # crop if larger
-        if H > H_ref:
-            dH = H - H_ref
-            top = dH // 2
-            x = x[..., top : top + H_ref, :, :]
-        if W > W_ref:
-            dW = W - W_ref
-            left = dW // 2
-            x = x[..., :, left : left + W_ref, :]
+def _film(g: jnp.ndarray, c: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Produce FiLM (scale, shift) from a conditioning vector g."""
+    h = nn.gelu(nn.Dense(2 * c)(g))
+    scale, shift = jnp.split(h, 2, axis=-1)
+    return scale, shift  # (B,c), (B,c)
 
-        # pad if smaller
-        H, W = int(x.shape[-3]), int(x.shape[-2])
-        if H < H_ref or W < W_ref:
-            pad_h = max(0, H_ref - H)
-            pad_w = max(0, W_ref - W)
-            pad_top = pad_h // 2
-            pad_bottom = pad_h - pad_top
-            pad_left = pad_w // 2
-            pad_right = pad_w - pad_left
-            pads = ((0, 0),)  # batch (or leading) dims – will expand later
-            # Build full pad spec for arbitrary rank NHWC:
-            # leading dims (if any): zeros
-            lead = [(0, 0)] * (x.ndim - 4)
-            pad_spec = (
-                *lead,
-                (pad_top, pad_bottom),  # H
-                (pad_left, pad_right),  # W
-                (0, 0),  # C
-            )
-            x = jnp.pad(x, pad_spec, mode="constant")
-        return x
+
+def _group_count(C: int) -> int:
+    # pick num_groups that divides C; prefer 8 then 4 then 2 then 1
+    for g in (8, 4, 2, 1):
+        if C % g == 0:
+            return g
+    return 1
+
+
+# ---------- 2.5D UNet blocks (no downsample along K) ----------
+
+
+def downsample_2d_keepK(x):  # (B,H,W,K,C)
+    H, W = x.shape[1], x.shape[2]
+    return jax.image.resize(
+        x, (x.shape[0], H // 2, W // 2, x.shape[3], x.shape[4]), method="linear"
+    )
+
+
+def upsample_2d_keepK(x):  # (B,H,W,K,C)
+    H, W = x.shape[1], x.shape[2]
+    return jax.image.resize(
+        x, (x.shape[0], H * 2, W * 2, x.shape[3], x.shape[4]), method="linear"
+    )
+
+
+class AttnBottleneck(nn.Module):
+    heads: int = 4
 
     @nn.compact
-    def __call__(self, x, t_embed):
-        # Optional sanity: enforce NHWC rank>=4
-        # assert x.ndim >= 4, f"UNet expects NHWC-ish input, got shape {x.shape}"
+    def __call__(self, x, train: bool = True):
+        # x: (B,H,W,K,C) -> (B, HWK, C)
+        B, H, W, K, C = x.shape
+        y = x.reshape(B, H * W * K, C)
+        attn = nn.SelfAttention(num_heads=self.heads, qkv_features=C)
+        y = attn(nn.LayerNorm()(y))
+        y = y + nn.Dense(C)(nn.gelu(nn.Dense(4 * C)(nn.LayerNorm()(y))))
+        return y.reshape(B, H, W, K, C)
 
-        te = nn.relu(nn.Dense(self.ch)(t_embed))
-        te = nn.relu(nn.Dense(self.ch)(te))
 
-        # Down
-        h1 = ResBlock(self.ch)(x)
-        h1 = self._inject(h1, te)
-        d1 = nn.max_pool(h1, window_shape=(2, 2), strides=(2, 2), padding="SAME")
+# ---------- 3D ResBlock keeping shapes with SAME padding ----------
+class ResBlock3D(nn.Module):
+    features: int
+    kernel: tuple = (3, 3, 1)  # don’t mix across K aggressively; keep K small & stable
 
-        h2 = ResBlock(self.ch * 2)(d1)
-        h2 = self._inject(h2, te)
-        d2 = nn.max_pool(h2, window_shape=(2, 2), strides=(2, 2), padding="SAME")
+    @nn.compact
+    def __call__(self, x):
+        # x: (B,H,W,K,C)
+        h = nn.GroupNorm(num_groups=1)(x)  # channels-last -> use few groups
+        h = nn.swish(h)
+        h = nn.Conv(self.features, self.kernel, padding="SAME")(h)
+        h = nn.GroupNorm(num_groups=1)(h)
+        h = nn.swish(h)
+        h = nn.Conv(self.features, self.kernel, padding="SAME")(h)
+        if x.shape[-1] != self.features:
+            x = nn.Conv(self.features, (1, 1, 1), padding="SAME")(x)
+        return x + h
 
-        h3 = ResBlock(self.ch * 4)(d2)
-        h3 = self._inject(h3, te)
 
-        # Up
-        u2 = nn.ConvTranspose(self.ch * 2, (2, 2), strides=(2, 2), padding="SAME")(h3)
-        u2 = self._match_hw(u2, h2)
+# ---------- Tiny 3D UNet w/ HW-only down/up, K fixed ----------
+class TinyUNet3D(nn.Module):
+    ch: int = 64
+    m_dim: int = 256  # modules embedding dim
+
+    def _inject(self, h, te, m_emb):
+        # h: (B,H,W,K,C) ; te: (B,D) ; m_emb: (B,M)
+        b, H, W, K, C = h.shape
+        cond = jnp.concatenate([te, m_emb], axis=-1)  # (B, D+M)
+        cond = nn.Dense(C)(cond)  # (B, C)
+        cond = cond[:, None, None, None, :]  # (B,1,1,1,C)
+        return h + cond
+
+    @nn.compact
+    def __call__(self, x, t_embed, m_emb):
+        # x: (B, H, W, K, C) with C=channels=3 here; K=3
+        # -------- Down --------
+        h1 = ResBlock3D(self.ch)(x)
+        h1 = self._inject(h1, t_embed, m_emb)
+        d1 = nn.max_pool(h1, window_shape=(2, 2, 1), strides=(2, 2, 1), padding="SAME")
+
+        h2 = ResBlock3D(self.ch * 2)(d1)
+        h2 = self._inject(h2, t_embed, m_emb)
+        d2 = nn.max_pool(h2, window_shape=(2, 2, 1), strides=(2, 2, 1), padding="SAME")
+
+        h3 = ResBlock3D(self.ch * 4)(d2)
+        h3 = self._inject(h3, t_embed, m_emb)
+
+        # -------- Up --------
+        u2 = nn.ConvTranspose(
+            self.ch * 2, kernel_size=(2, 2, 1), strides=(2, 2, 1), padding="SAME"
+        )(h3)
+        # shapes now match spatially with h2
         u2 = jnp.concatenate([u2, h2], axis=-1)
-        u2 = ResBlock(self.ch * 2)(u2)
+        u2 = ResBlock3D(self.ch * 2)(u2)
+        u2 = self._inject(u2, t_embed, m_emb)
 
-        u1 = nn.ConvTranspose(self.ch, (2, 2), strides=(2, 2), padding="SAME")(u2)
-        u1 = self._match_hw(u1, h1)
+        u1 = nn.ConvTranspose(
+            self.ch, kernel_size=(2, 2, 1), strides=(2, 2, 1), padding="SAME"
+        )(u2)
+        # shapes now match spatially with h1
         u1 = jnp.concatenate([u1, h1], axis=-1)
-        u1 = ResBlock(self.ch)(u1)
+        u1 = ResBlock3D(self.ch)(u1)
+        u1 = self._inject(u1, t_embed, m_emb)
 
-        eps = nn.Conv(x.shape[-1], (1, 1), padding="SAME")(u1)
-        return eps
+        # predict noise/v same shape as input
+        eps = nn.Conv(x.shape[-1], kernel_size=(1, 1, 1), padding="SAME")(u1)
+        return eps  # (B,H,W,K,C)
 
 
+TinyUNet = TinyUNet3D
+
+
+############# MODULES
+class MHA(nn.Module):
+    d: int
+    h: int = 4
+
+    @nn.compact
+    def __call__(self, qx, kx=None, vx=None, q_mask=None, k_mask=None):
+        if kx is None:
+            kx = qx
+        if vx is None:
+            vx = kx
+        q = nn.Dense(self.d)(qx)
+        k = nn.Dense(self.d)(kx)
+        v = nn.Dense(self.d)(vx)
+        attn_mask = None
+        if (q_mask is not None) and (k_mask is not None):
+            attn_mask = nn_attn.make_attention_mask(q_mask, k_mask)  # (B,1,Q,K)
+        return nn.MultiHeadDotProductAttention(num_heads=self.h)(
+            q, k, v, mask=attn_mask
+        )
+
+
+class SAB(nn.Module):
+    d: int
+    h: int = 4
+
+    @nn.compact
+    def __call__(self, x, key_mask=None):
+        B, S, _ = x.shape
+        k_mask_bool = None
+        if key_mask is not None:
+            k_mask_bool = (
+                (key_mask[..., 0] > 0) if key_mask.ndim == 3 else key_mask.astype(bool)
+            )
+        q_mask_bool = jnp.ones((B, S), dtype=bool)
+        y = MHA(self.d, self.h)(x, None, None, q_mask=q_mask_bool, k_mask=k_mask_bool)
+        x = x + y
+        x = x + nn.Dense(self.d)(nn.gelu(nn.Dense(self.d * 4)(x)))
+        return x
+
+
+class PMA(nn.Module):
+    d: int
+    m: int = 1
+    h: int = 4
+
+    @nn.compact
+    def __call__(self, x, key_mask=None):
+        B, S, d = x.shape
+        seeds = self.param("seed", nn.initializers.normal(0.02), (self.m, self.d))
+        q = jnp.repeat(seeds[None, :, :], B, axis=0)  # (B,m,d)
+        k_mask_bool = None
+        if key_mask is not None:
+            k_mask_bool = (
+                (key_mask[..., 0] > 0) if key_mask.ndim == 3 else key_mask.astype(bool)
+            )
+        q_mask_bool = jnp.ones((B, self.m), dtype=bool)
+        return MHA(self.d, self.h)(q, x, x, q_mask=q_mask_bool, k_mask=k_mask_bool)
+
+
+# ---------- featurizer for ragged modules -> (T,S,F) ----------
 def _robust_stats(arr: np.ndarray) -> np.ndarray:
     a = np.asarray(arr).astype(np.float32)
     finite = np.isfinite(a)
@@ -139,32 +244,21 @@ def _robust_stats(arr: np.ndarray) -> np.ndarray:
 
 
 def featurize_modules_trajectory(
-    mods_trajectory: List[
-        List[Any]
-    ],  # length T; each is a list of tensors (the set at step t)
-    T_max: int = 8,
+    mods_trajectory: List[List[Any]],  # length T; each step is a list of tensors
+    T_max: int = 1,
     S_max: int = 16,
     add_pos_ids: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """
-    Returns:
-      feats: (T_max, S_max, F) float32
-      set_mask: (T_max, S_max, 1) 1=valid element in set
-      time_mask: (T_max, 1)        1=valid timestep
-    We truncate/pad both time and set sizes.
-    """
     traj = mods_trajectory[:T_max]
     T = len(traj)
-
-    feat_slices = []
-    set_masks = []
+    feat_rows, set_masks = [], []
     for t in range(T_max):
         if t < T:
             elems = traj[t][:S_max]
             row = []
             for i, e in enumerate(elems):
                 f = _robust_stats(np.array(e))
-                if add_pos_ids:  # element position in set
+                if add_pos_ids:
                     oh = np.zeros((S_max,), dtype=np.float32)
                     oh[min(i, S_max - 1)] = 1.0
                     f = np.concatenate([f, oh], axis=0)
@@ -175,7 +269,7 @@ def featurize_modules_trajectory(
             F = row[0].shape[0]
             if len(row) < S_max:
                 row += [np.zeros((F,), dtype=np.float32)] * (S_max - len(row))
-            feat_slices.append(np.stack(row, axis=0))
+            feat_rows.append(np.stack(row, axis=0))
             set_masks.append(
                 np.array(
                     [1.0] * min(len(traj[t]), S_max)
@@ -184,14 +278,13 @@ def featurize_modules_trajectory(
             )
         else:
             F = (
-                feat_slices[0].shape[1]
-                if feat_slices
+                feat_rows[0].shape[1]
+                if feat_rows
                 else (13 + (S_max if add_pos_ids else 0))
             )
-            feat_slices.append(np.zeros((S_max, F), dtype=np.float32))
+            feat_rows.append(np.zeros((S_max, F), dtype=np.float32))
             set_masks.append(np.zeros((S_max, 1), dtype=np.float32))
-
-    feats = jnp.array(np.stack(feat_slices, axis=0))  # (T_max,S_max,F)
+    feats = jnp.array(np.stack(feat_rows, axis=0))  # (T_max,S_max,F)
     set_mask = jnp.array(np.stack(set_masks, axis=0))  # (T_max,S_max,1)
     time_mask = jnp.array(np.array([1.0] * T + [0.0] * (T_max - T), dtype=np.float32))[
         :, None
@@ -199,186 +292,94 @@ def featurize_modules_trajectory(
     return feats, set_mask, time_mask
 
 
-class MHA(nn.Module):
-    d: int
-    h: int = 4
-
-    @nn.compact
-    def __call__(self, qx, kx=None, vx=None, q_mask=None, k_mask=None):
-        """
-        qx: (B, Q, d)  kx,vx: (B, K, d) or None -> self-attention if None
-        q_mask: (B, Q) bool   k_mask: (B, K) bool
-        """
-        if kx is None:
-            kx = qx
-        if vx is None:
-            vx = kx
-
-        q = nn.Dense(self.d)(qx)
-        k = nn.Dense(self.d)(kx)
-        v = nn.Dense(self.d)(vx)
-
-        attn_mask = None
-        if (q_mask is not None) and (k_mask is not None):
-            # shape (B, 1, Q, K), broadcastable to heads
-            attn_mask = nn_attn.make_attention_mask(q_mask, k_mask)
-
-        return nn.MultiHeadDotProductAttention(num_heads=self.h)(
-            q, k, v, mask=attn_mask
-        )
-
-
-class SAB(nn.Module):
-    d: int
-    h: int = 4
-
-    @nn.compact
-    def __call__(self, x, key_mask=None):
-        """
-        x: (B, S, d)
-        key_mask: (B, S, 1) or (B, S) -> True keeps token
-        """
-        B, S, _ = x.shape
-        k_mask_bool = None
-        if key_mask is not None:
-            k_mask_bool = (
-                (key_mask[..., 0] > 0) if key_mask.ndim == 3 else key_mask.astype(bool)
-            )
-        # self-attn: q_mask = all ones (valid) over S
-        q_mask_bool = jnp.ones((B, S), dtype=bool)
-        y = MHA(self.d, self.h)(x, None, None, q_mask=q_mask_bool, k_mask=k_mask_bool)
-        x = x + y
-        x = x + nn.Dense(self.d)(nn.gelu(nn.Dense(self.d * 4)(x)))
-        return x
-
-
-class PMA(nn.Module):
-    d: int
-    m: int = 1
-    h: int = 4
-
-    @nn.compact
-    def __call__(self, x, key_mask=None):
-        """
-        x: (B, S, d)
-        key_mask: (B, S, 1) or (B, S) bool-like
-        returns: (B, m, d)
-        """
-        B, S, d = x.shape
-        seeds = self.param(
-            "seed", nn.initializers.normal(stddev=0.02), (self.m, self.d)
-        )
-        q = jnp.repeat(seeds[None, :, :], B, axis=0)  # (B, m, d)
-
-        k_mask_bool = None
-        if key_mask is not None:
-            k_mask_bool = (
-                (key_mask[..., 0] > 0) if key_mask.ndim == 3 else key_mask.astype(bool)
-            )
-        q_mask_bool = jnp.ones((B, self.m), dtype=bool)
-
-        return MHA(self.d, self.h)(q, x, x, q_mask=q_mask_bool, k_mask=k_mask_bool)
-
-
-def embed_modules_trajectory(enc_apply, enc_params, mods_traj_batch, T_max=8, S_max=16):
-    feats_list, set_masks, time_masks = [], [], []
-    for traj in mods_traj_batch:  # batch length B
-        feats, s_mask, t_mask = featurize_modules_trajectory(
-            traj, T_max=T_max, S_max=S_max
-        )
-        feats_list.append(feats)
-        set_masks.append(s_mask)
-        time_masks.append(t_mask)
-    feats_b = jnp.stack(feats_list, axis=0)  # (B,T,S,F)
-    set_b = jnp.stack(set_masks, axis=0)  # (B,T,S,1)
-    time_b = jnp.stack(time_masks, axis=0)  # (B,T,1)
-    return enc_apply({"params": enc_params}, feats_b, set_b, time_b)  # (B,out)
-
-
+# ---------- your encoder, unchanged ----------
 class ModulesTrajectoryEncoder(nn.Module):
-    d_set: int = 128  # per-set emb dim
-    d_time: int = 256  # temporal model dim
+    d_set: int = 128
+    d_time: int = 256
     out_dim: int = 256
     n_sab: int = 2
     n_layers_time: int = 2
     heads: int = 4
     m_pma: int = 1
     dropout_rate: float = 0.0
-    deterministic: bool = True  # set False during train if you enable dropout
+    deterministic: bool = True
 
     @nn.compact
     def __call__(
         self, feats: jnp.ndarray, set_mask: jnp.ndarray, time_mask: jnp.ndarray
     ):
-        """
-        feats:     (B,T,S,F)
-        set_mask:  (B,T,S,1)  float/bool; 1=valid
-        time_mask: (B,T,1)    float/bool; 1=valid
-        returns:   (B,out_dim)
-        """
         B, T, S, F = feats.shape
-
-        # -------- per-time-step set encoder (SAB + PMA) --------
-        x = feats.reshape(B * T, S, F)  # (B*T, S, F)
-        m = set_mask.reshape(B * T, S, 1)  # (B*T, S, 1)
-
-        # project to set dim
-        x = nn.Dense(self.d_set)(x)  # (B*T, S, d_set)
-
-        # SAB stack (self-attn over set elements, mask-aware)
+        x = feats.reshape(B * T, S, F)
+        m = set_mask.reshape(B * T, S, 1)
+        x = nn.Dense(self.d_set)(x)
         for _ in range(self.n_sab):
-            x = SAB(self.d_set, self.heads)(x, key_mask=m)  # (B*T, S, d_set)
-
-        # PMA pooled representation per time step
-        x = PMA(self.d_set, m=self.m_pma, h=self.heads)(
-            x, key_mask=m
-        )  # (B*T, m, d_set)
-        x = x.squeeze(1)  # (B*T, d_set)
-
-        # back to (B, T, d_set)
+            x = SAB(self.d_set, self.heads)(x, key_mask=m)
+        x = PMA(self.d_set, m=self.m_pma, h=self.heads)(x, key_mask=m).squeeze(1)
         x = x.reshape(B, T, self.d_set)
-
-        # -------- temporal encoder (Transformer over T) --------
-        # project to temporal model dim
-        x = nn.Dense(self.d_time)(x)  # (B, T, d_time)
-
-        # boolean time mask (B,T)
+        x = nn.Dense(self.d_time)(x)
         tmask_bool = (
             (time_mask.squeeze(-1) > 0)
             if time_mask.ndim == 3
             else time_mask.astype(bool)
         )
-        # SelfAttention expects (B, 1, T, T) mask
-        attn_mask = nn_attn.make_attention_mask(tmask_bool, tmask_bool)  # (B,1,T,T)
-
+        attn_mask = nn_attn.make_attention_mask(tmask_bool, tmask_bool)
         for _ in range(self.n_layers_time):
-            # pre-norm block
             h = nn.LayerNorm()(x)
             y = nn.SelfAttention(num_heads=self.heads, qkv_features=self.d_time)(
                 h, mask=attn_mask
-            )  # (B, T, d_time)
+            )
             if self.dropout_rate > 0:
                 y = nn.Dropout(self.dropout_rate)(y, deterministic=self.deterministic)
             x = x + y
-
             h = nn.LayerNorm()(x)
             y = nn.Dense(self.d_time * 4)(h)
             y = nn.gelu(y)
             y = nn.Dense(self.d_time)(y)
             if self.dropout_rate > 0:
                 y = nn.Dropout(self.dropout_rate)(y, deterministic=self.deterministic)
-            x = x + y  # (B, T, d_time)
+            x = x + y
+        time_w = time_mask
+        denom = jnp.clip(jnp.sum(time_w, axis=1), 1e-6, None)
+        x_mean = jnp.sum(x * time_w, axis=1) / denom
+        z = nn.Dense(self.out_dim)(nn.gelu(nn.Dense(self.out_dim)(x_mean)))
+        return z  # (B,out_dim)
 
-        # masked mean over time
-        time_w = time_mask  # (B,T,1)
-        denom = jnp.clip(jnp.sum(time_w, axis=1), 1e-6, None)  # (B,1)
-        x_mean = jnp.sum(x * time_w, axis=1) / denom  # (B, d_time)
 
-        # head
-        z = nn.Dense(self.out_dim)(
-            nn.gelu(nn.Dense(self.out_dim)(x_mean))
-        )  # (B,out_dim)
-        return z
+# ---------- tiny builder that returns an embed_fn you can pass batches of ragged modules ----------
+def build_modules_embedder(rng, out_dim=256, T_max=1, S_max=16):
+    """
+    Returns: (encoder_module, encoder_params, embed_fn)
+      embed_fn(mods_batch: List[List[np.ndarray|torch.Tensor|jnp.ndarray]]) -> (B,out_dim) jnp.ndarray
+    For now T_max=1 because your modules are flat lists; wrap to T=1 trajectories.
+    """
+    enc = ModulesTrajectoryEncoder(out_dim=out_dim)
+    F = 13 + S_max  # robust stats + 1-of-S_max positional id
+    feats_d = jnp.zeros((1, T_max, S_max, F), jnp.float32)
+    set_d = jnp.zeros((1, T_max, S_max, 1), jnp.float32)
+    time_d = jnp.ones((1, T_max, 1), jnp.float32)
+    enc_params = enc.init(rng, feats_d, set_d, time_d)["params"]
+
+    def as_T1_traj(mods_batch):
+        # your dataset has a flat list per sample -> wrap as length-1 trajectory
+        return [[mods] for mods in mods_batch]
+
+    def embed_fn(mods_batch):
+        traj_batch = as_T1_traj(mods_batch)
+        feats_list, set_list, time_list = [], [], []
+        for traj in traj_batch:
+            f, s, t = featurize_modules_trajectory(traj, T_max=T_max, S_max=S_max)
+            feats_list.append(f)
+            set_list.append(s)
+            time_list.append(t)
+        feats_b = jnp.stack(feats_list, 0)  # (B,T,S,F)
+        set_b = jnp.stack(set_list, 0)  # (B,T,S,1)
+        time_b = jnp.stack(time_list, 0)  # (B,T,1)
+        return enc.apply({"params": enc_params}, feats_b, set_b, time_b)  # (B,out_dim)
+
+    return enc, enc_params, embed_fn
+
+
+### ENEGY
 
 
 class EnergyNetwork(nn.Module):
