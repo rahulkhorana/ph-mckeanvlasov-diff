@@ -1,143 +1,133 @@
+# Usage: python viz_generated.py --npy samples_landscapes.npy --out generated_samples
+
 import os
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D proj)
+
+plt.ioff()
 
 
-def unpack_landscapes(arr, KS: int):
-    """
-    arr: (B, steps, H, W, C) with C = 3*KS
-    -> (B, steps, H, W, 3, KS)
-    """
-    B, S, H, W, C = arr.shape
-    assert C == 3 * KS, f"Expected C=3*KS, got C={C}, KS={KS}"
-    return arr.reshape(B, S, H, W, 3, KS)
+def load_samples(path: str) -> np.ndarray:
+    arr = np.load(path)
+    if arr.ndim != 5:
+        raise ValueError(f"Expected 5D array (B,H,W,K,C); got {arr.shape}")
+    B, H, W, K, C = arr.shape
+    if C != 3:
+        raise ValueError(f"Last dim must be degrees=3; got C={C}")
+    return arr.astype(np.float32)  # (B,H,W,K,3)
 
 
-def to_rgb(lans_3ks, mode="k0", k_idx=0):
+def robust_scale(x: np.ndarray, clip_pct: float = 1.0) -> np.ndarray:
+    """Per-surface robust [0,1] scaling with percentile clipping."""
+    a = x.copy()
+    a[~np.isfinite(a)] = 0.0
+    if clip_pct and clip_pct > 0:
+        lo = np.percentile(a, clip_pct)
+        hi = np.percentile(a, 100.0 - clip_pct)
+        if hi <= lo:
+            hi = lo + 1e-6
+        a = np.clip(a, lo, hi)
+    mn = a.min()
+    mx = a.max()
+    if mx <= mn + 1e-8:
+        return np.zeros_like(a)
+    return (a - mn) / (mx - mn)
+
+
+def plot_sample_surfaces(
+    sample: np.ndarray,
+    out_path: str,
+    stride: int = 2,
+    elev: float = 45,
+    azim: float = -135,
+    cmap: str = "viridis",
+    title: str | None = None,
+):
     """
-    lans_3ks: (B, H, W, 3, KS) final-step landscapes
-    mode:
-      - "k0":   use specific k index -> RGB = (H0_k, H1_k, H2_k)
-      - "mean": average across KS -> RGB = (mean H0, mean H1, mean H2)
-      - "pca":  project 6 chans -> 3 via PCA (fit per-batch)
-    returns: (B, H, W, 3) float32
+    sample: (H,W,K,3) float32
+    saves a figure with 3 rows (degrees 0/1/2) x K columns (ks slices)
     """
-    B, H, W, D, KS = lans_3ks.shape  # D=3 degrees
-    if mode == "k0":
-        assert 0 <= k_idx < KS, f"k_idx out of range 0..{KS-1}"
-        rgb = np.stack(
-            [
-                lans_3ks[..., 0, k_idx],  # H0
-                lans_3ks[..., 1, k_idx],  # H1
-                lans_3ks[..., 2, k_idx],  # H2
-            ],
-            axis=-1,
+    H, W, K, C = sample.shape
+    assert C == 3, f"expected degrees=3, got {C}"
+    X, Y = np.meshgrid(np.arange(W), np.arange(H))  # note: X is cols, Y is rows
+
+    # figure size scaled by K
+    fig = plt.figure(figsize=(4 * K, 9))  # width grows with K, 3 rows tall
+    if title:
+        fig.suptitle(title, y=0.98, fontsize=12)
+
+    for d in range(3):  # degrees rows
+        for k in range(K):  # ks columns
+            Z = robust_scale(sample[:, :, k, d])  # (H,W)
+            ax = fig.add_subplot(3, K, d * K + (k + 1), projection="3d")
+            assert isinstance(ax, Axes3D)
+            ax.plot_surface(
+                X[::stride, ::stride],
+                Y[::stride, ::stride],
+                Z[::stride, ::stride],
+                rstride=1,
+                cstride=1,
+                linewidth=0,
+                antialiased=True,
+                cmap=cmap,
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_zticks([])  # type: ignore
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_box_aspect((1, 1, 0.35))  # flatter z so it’s readable
+            ax.set_title(f"deg {d}, k {k}", pad=6, fontsize=9)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--npy", type=str, default="samples_landscapes.npy")
+    ap.add_argument("--out", type=str, default="generated_samples")
+    ap.add_argument("--max", type=int, default=16, help="max samples to render")
+    ap.add_argument("--stride", type=int, default=2, help="surface downsample stride")
+    ap.add_argument("--elev", type=float, default=45.0)
+    ap.add_argument("--azim", type=float, default=-135.0)
+    ap.add_argument("--cmap", type=str, default="viridis")
+    args = ap.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    arr = load_samples(args.npy)  # (B,H,W,K,3)
+    B, H, W, K, C = arr.shape
+    print(f"loaded: {args.npy}  shape={arr.shape}")
+
+    # also save a quick 2D heatmap grid for sanity (degree=1 by default)
+    for i in range(min(B, args.max)):
+        sample = arr[i]  # (H,W,K,3)
+        # 3D grid figure
+        out3d = os.path.join(args.out, f"sample_{i:03d}_3d.png")
+        plot_sample_surfaces(
+            sample,
+            out3d,
+            stride=args.stride,
+            elev=args.elev,
+            azim=args.azim,
+            cmap=args.cmap,
         )
-        return rgb.astype(np.float32)
-    elif mode == "mean":
-        m = lans_3ks.mean(axis=-1)  # (B,H,W,3)
-        return m.astype(np.float32)
-    elif mode == "pca":
-        X = lans_3ks.reshape(B, H, W, D * KS).astype(np.float32)  # (B,H,W,6)
-        Xc_list = []
-        for b in range(B):
-            Xb = X[b].reshape(-1, D * KS)
-            mu = Xb.mean(axis=0, keepdims=True)
-            Xc = Xb - mu
-            # tiny PCA: cov in feature space
-            cov = (Xc.T @ Xc) / max(1, Xc.shape[0] - 1)  # (6,6)
-            eigvals, eigvecs = np.linalg.eigh(cov)
-            Wp = eigvecs[:, -3:]  # top 3
-            Y = Xc @ Wp  # (H*W, 3)
-            Xc_list.append(Y.reshape(H, W, 3))
-        rgb = np.stack(Xc_list, axis=0)
-        return rgb
-    else:
-        raise ValueError(f"Unknown mode {mode}")
 
+        # optional 2D quicklook: degree=1 across all k in a row
+        fig, axes = plt.subplots(1, K, figsize=(3 * K, 3))
+        for k in range(K):
+            img = robust_scale(sample[:, :, k, 1])  # degree-1 heat
+            axes[k].imshow(img, cmap=args.cmap)  # type: ignore
+            axes[k].set_title(f"deg 1, k {k}", fontsize=9)  # type: ignore
+            axes[k].axis("off")  # type: ignore
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.out, f"sample_{i:03d}_2d.png"), dpi=150)
+        plt.close(fig)
 
-def normalize_to_uint8(imgs, per_image=True, clip_percentile=1.0):
-    """
-    imgs: (B,H,W,3) float
-    Returns uint8 in [0,255]. If per_image, normalize each sample separately.
-    clip_percentile: e.g. 1.0 -> clip to [1,99] percentiles before scaling.
-    """
-    x = imgs.copy()
-    if clip_percentile is not None and clip_percentile > 0:
-        lo = clip_percentile
-        hi = 100.0 - clip_percentile
-        if per_image:
-            for i in range(x.shape[0]):
-                a = np.percentile(x[i], lo)
-                b = np.percentile(x[i], hi)
-                if b <= a:
-                    b = a + 1e-6
-                x[i] = np.clip(x[i], a, b)
-        else:
-            a = np.percentile(x, lo)
-            b = np.percentile(x, hi)
-            if b <= a:
-                b = a + 1e-6
-            x = np.clip(x, a, b)
-    # scale to [0,1]
-    if per_image:
-        mins = x.reshape(x.shape[0], -1, 3).min(axis=1, keepdims=True)
-        maxs = x.reshape(x.shape[0], -1, 3).max(axis=1, keepdims=True)
-        denom = np.clip(maxs - mins, 1e-8, None)
-        x = (x - mins.reshape(-1, 1, 1, 3)) / denom.reshape(-1, 1, 1, 3)
-    else:
-        a = x.min()
-        b = x.max()
-        denom = max(b - a, 1e-8)
-        x = (x - a) / denom
-    return (np.clip(x, 0, 1) * 255.0).astype(np.uint8)
+    print(f"wrote 3D+2D previews to {args.out}/")
 
-
-def psnr(x, y, max_val=1.0):
-    """
-    x,y: (H,W,3) or (B,H,W,3) in [0,1]
-    """
-    x = x.astype(np.float32)
-    y = y.astype(np.float32)
-    mse = np.mean((x - y) ** 2, axis=tuple(range(x.ndim - 1)))
-    return 20.0 * np.log10(max_val) - 10.0 * np.log10(np.clip(mse, 1e-12, None))
-
-
-# -------------- main --------------
 
 if __name__ == "__main__":
-    KS = 2
-    npy_path = "samples_landscapes.npy"  # (B, steps, H, W, 3*KS)
-    out_dir = "rgb_final"
-    os.makedirs(out_dir, exist_ok=True)
-
-    arr = np.load(npy_path)  # (B, steps, H, W, C)
-    B, S, H, W, C = arr.shape
-    lans = unpack_landscapes(arr, KS=KS)  # (B, S, H, W, 3, KS)
-
-    final = lans[:, -1]  # (B, H, W, 3, KS) last step
-    # choose RGB mapping:
-    #   mode="k0" (use k=0), "mean" (avg over k), or "pca" (6->3)
-    rgb_f = to_rgb(final, mode="k0", k_idx=0)  # (B, H, W, 3) float
-    # If you plan PSNR/FID vs ground-truth *RGB* landscapes (in [0,1]),
-    # keep a [0,1] copy and only save PNGs as uint8 separately.
-    rgb_f_unit = rgb_f.copy()
-    rgb_png = normalize_to_uint8(rgb_f, per_image=True, clip_percentile=1.0)
-
-    # save PNGs
-    for i in range(B):
-        plt.imsave(os.path.join(out_dir, f"sample_{i:03d}.png"), rgb_png[i])
-
-    print(f"Saved {B} RGB images to {out_dir}/")
-
-    # -------- optional: PSNR vs GT --------
-    # If you have GT landscapes as (B,H,W,3*KS) or (B,3,KS,H,W):
-    # Example loader stubs (replace with your actual GT):
-    # gt = np.load("gt_landscapes.npy")  # shape must match H,W and channels
-    # If GT is (B,3,KS,H,W), turn to (B,H,W,3,KS) then to RGB the same way:
-    # gt_hwck = np.transpose(gt, (0, 3, 4, 1, 2))  # (B,H,W,3,KS)
-    # gt_rgb  = to_rgb(gt_hwck, mode="k0", k_idx=0)
-    # # Ensure both in [0,1] for PSNR
-    # x = np.clip(rgb_f_unit, 0, 1)
-    # y = np.clip(gt_rgb,     0, 1)
-    # print("PSNR per-image:", psnr(x, y, max_val=1.0))
+    main()
