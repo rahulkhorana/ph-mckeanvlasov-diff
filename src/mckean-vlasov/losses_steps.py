@@ -1,198 +1,172 @@
+# losses_steps.py
 from typing import Callable, Tuple
-import jax
-import jax.numpy as jnp
-import optax
-from flax.training.train_state import TrainState
-from flax.core import FrozenDict
-import flax
+import jax, jax.numpy as jnp
 from flax import struct
+from flax.training.train_state import TrainState
+import optax
+from models import time_embed
 from functools import partial
+from flax.core import FrozenDict
+from dataclasses import replace as dc_replace
 
 
-# -------- Time embed (reuse from models) --------
-from models import time_embed as time_embed_fn
-
-# -------- Schedules --------
-
-
+# ---------- schedules ----------
 def cosine_beta_schedule(T: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    # Nichol & Dhariwal's cosine schedule
+    steps = jnp.arange(T + 1, dtype=jnp.float32)
     s = 0.008
-    t = jnp.linspace(0, T, T + 1, dtype=jnp.float32) / T
-    alphas_cumprod = jnp.cos((t + s) / (1 + s) * jnp.pi / 2) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    alpha_bars = alphas_cumprod[1:]  # length T
-    alphas = alpha_bars / jnp.concatenate(
-        [jnp.array([1.0], jnp.float32), alpha_bars[:-1]], axis=0
-    )
-    betas = 1.0 - alphas
-    return betas, alphas, alpha_bars
-
-
-def _cosine_schedule(T):
-    import numpy as np
-
-    s = 0.008
-    t = np.linspace(0, T, T + 1, dtype=np.float32) / T
-    alphas_cum = np.cos((t + s) / (1 + s) * np.pi * 0.5) ** 2
-    alphas_cum = alphas_cum / alphas_cum[0]
-    alpha_bars = jnp.array(alphas_cum[1:])  # length T
-    alphas = alpha_bars[1:] / alpha_bars[:-1]
-    alphas = jnp.concatenate([alphas[:1], alphas], axis=0)
-    betas = 1.0 - alphas
-    return jnp.clip(betas, 1e-5, 0.999)
+    alphas_bar = jnp.cos(((steps / T + s) / (1 + s)) * jnp.pi / 2) ** 2
+    alphas_bar = alphas_bar / alphas_bar[0]
+    a_bar_t = alphas_bar[1:]
+    a_bar_tm1 = alphas_bar[:-1]
+    betas = jnp.clip(1.0 - (a_bar_t / a_bar_tm1), 1e-6, 0.999)
+    alphas = 1.0 - betas
+    return betas, alphas, jnp.cumprod(alphas)
 
 
 def linear_beta_schedule(T: int, beta_start=1e-4, beta_end=2e-2):
     betas = jnp.linspace(beta_start, beta_end, T, dtype=jnp.float32)
     alphas = 1.0 - betas
-    alpha_bars = jnp.cumprod(alphas)
-    return betas, alphas, alpha_bars
+    return betas, alphas, jnp.cumprod(alphas)
 
 
-# -------- Diffusion state with EMA --------
-
-
+# ---------- states ----------
 @struct.dataclass
-class DiffusionState(TrainState):
+class DiffusionState:
+    train: TrainState
     betas: jnp.ndarray
     alphas: jnp.ndarray
     alpha_bars: jnp.ndarray
     T: int
     v_prediction: bool
+    ema_params: FrozenDict
+    ema_decay: float
+
+
+@struct.dataclass
+class EnergyState:
+    train: TrainState
 
 
 def create_diffusion_state(
-    rng, apply_fn, init_params, T=1000, lr=2e-4, v_prediction=True, schedule="cosine"
-):
+    rng,
+    apply_fn: Callable,
+    init_params,
+    T: int = 1000,
+    lr: float = 2e-4,
+    v_prediction: bool = True,
+    schedule: str = "cosine",
+    ema_decay: float = 0.999,
+) -> DiffusionState:
     if schedule == "cosine":
-        betas = _cosine_schedule(T)
+        betas, alphas, alpha_bars = cosine_beta_schedule(T)
     else:
-        betas = jnp.linspace(1e-4, 2e-2, T, dtype=jnp.float32)
-    alphas = 1.0 - betas
-    alpha_bars = jnp.cumprod(alphas, axis=0)
-
+        betas, alphas, alpha_bars = linear_beta_schedule(T)
     tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
-    return DiffusionState.create(
-        apply_fn=apply_fn,
-        params=init_params,
-        tx=tx,
+    train = TrainState.create(apply_fn=apply_fn, params=init_params, tx=tx)
+    return DiffusionState(
+        train=train,
         betas=betas,
         alphas=alphas,
         alpha_bars=alpha_bars,
-        T=int(T),
-        v_prediction=bool(v_prediction),
+        T=T,
+        v_prediction=v_prediction,
+        ema_params=init_params,
+        ema_decay=ema_decay,
     )
 
 
-# -------- MinSNR weighting (optional) --------
+def create_energy_state(
+    apply_fn: Callable, init_params, lr: float = 1e-3
+) -> EnergyState:
+    tx = optax.adam(lr)
+    train = TrainState.create(apply_fn=apply_fn, params=init_params, tx=tx)
+    return EnergyState(train=train)
 
 
-def _minsnr_weight(alpha_bar_t: jnp.ndarray, gamma: float = 5.0):
-    snr = alpha_bar_t / jnp.clip(1.0 - alpha_bar_t, 1e-8, None)
-    w = jnp.minimum(snr, jnp.array(gamma, dtype=jnp.float32)) / jnp.clip(
-        snr, 1e-8, None
-    )
-    return w
-
-
-# -------- DDPM loss with v-pred --------
-
-
-def _targets(x0, eps, a_bar_t, v_prediction: bool):
-    if v_prediction:
-        # v = sqrt(a_bar) * eps - sqrt(1 - a_bar) * x0
-        return (
-            jnp.sqrt(a_bar_t)[:, None, None, None, None] * eps
-            - jnp.sqrt(1.0 - a_bar_t)[:, None, None, None, None] * x0
-        )
-    else:
-        return eps
-
-
+# ---------- losses ----------
 def _ddpm_loss(
     unet_apply,
     params,
     rng,
-    x0,  # (B,H,W,K,C)
-    alpha_bars,  # (T,)
-    alphas,  # (T,)  (kept for completeness if you use it later)
-    v_prediction: bool,  # Python bool (static at trace time)
-    m_dim: int = 256,
+    x0,
+    cond_vec,
+    alpha_bars,
+    alphas,
+    v_prediction: bool,
 ):
     B = x0.shape[0]
-    T = alpha_bars.shape[0]  # derive T from schedule (array shape), not from state
-
     key_t, key_eps = jax.random.split(rng)
-    t = jax.random.randint(key_t, (B,), 0, T)  # (B,)
-    eps = jax.random.normal(key_eps, x0.shape)  # (B,H,W,K,C)
+    T = alpha_bars.shape[0]
+    t = jax.random.randint(key_t, (B,), 0, T)
+    t_cont = (t.astype(jnp.float32) + 0.5) / float(T)
 
-    a_bar = alpha_bars[t][..., None, None, None, None]  # (B,1,1,1,1)
-    xt = jnp.sqrt(a_bar) * x0 + jnp.sqrt(1.0 - a_bar) * eps
+    eps = jax.random.normal(key_eps, x0.shape)
+    a_bar = alpha_bars[t][:, None, None, None, None]
+    sqrt_ab = jnp.sqrt(a_bar)
+    sqrt_1ab = jnp.sqrt(1.0 - a_bar)
 
-    # continuous time in [0,1]
-    t_cont = (t.astype(jnp.float32) + 0.5) / jnp.float32(T)
-    temb = time_embed_fn(t_cont, dim=128)  # (B,128)
+    xt = sqrt_ab * x0 + sqrt_1ab * eps
+    temb = time_embed(t_cont, dim=128)
 
-    # unconditional diffusion: zero modules embedding
-    m_emb = jnp.zeros((B, m_dim), x0.dtype)
-
-    pred = unet_apply({"params": params}, xt, temb, m_emb)  # (B,H,W,K,C)
+    pred = unet_apply({"params": params}, xt, temb, cond_vec)  # eps or v
 
     if v_prediction:
-        # v-pred target using alpha_bar
-        target = jnp.sqrt(a_bar) * eps - jnp.sqrt(1.0 - a_bar) * x0
-    else:
+        # convert predicted v -> eps_hat
+        eps_hat = jnp.sqrt(a_bar) * pred + jnp.sqrt(1.0 - a_bar) * xt
         target = eps
+        loss = jnp.mean((target - eps_hat) ** 2)
+    else:
+        loss = jnp.mean((eps - pred) ** 2)
 
-    return jnp.mean((pred - target) ** 2)
+    return loss
 
 
 @partial(jax.jit, static_argnames=("v_prediction",))
-def diffusion_train_step(state, batch_imgs, rng, v_prediction: bool):
-    """state must carry: apply_fn, params, alpha_bars, alphas"""
-
+def diffusion_train_step(
+    state: DiffusionState,
+    batch_vol,
+    cond_vec,
+    rng,
+    v_prediction: bool,
+):
     def loss_fn(params):
         return _ddpm_loss(
-            state.apply_fn,
+            state.train.apply_fn,
             params,
             rng,
-            batch_imgs,
+            batch_vol,
+            cond_vec,
             state.alpha_bars,
             state.alphas,
             v_prediction,
         )
 
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    new_state = state.apply_gradients(grads=grads)
+    loss, grads = jax.value_and_grad(loss_fn)(state.train.params)
+    new_train = state.train.apply_gradients(grads=grads)
+    new_ema = optax.incremental_update(
+        new_train.params, state.ema_params, 1.0 - state.ema_decay
+    )
+    # dataclasses.replace creates a new frozen dataclass with updated fields
+    new_state = dc_replace(state, train=new_train, ema_params=new_ema)
     return new_state, loss
 
 
-# -------- Energy training (unchanged API) --------
-
-
-@struct.dataclass
-class EnergyState(TrainState):
-    pass
-
-
-def create_energy_state(apply_fn, params, lr: float = 1e-3) -> EnergyState:
-    tx = optax.adam(lr)
-    return EnergyState.create(apply_fn=apply_fn, params=params, tx=tx)
+def energy_contrastive_loss(E_apply, eparams, x, cond_vec, neg_k: int = 4):
+    e_pos = E_apply({"params": eparams}, x, cond_vec)  # (B,)
+    losses = []
+    for k in range(1, neg_k + 1):
+        cond_neg = jnp.roll(cond_vec, k, axis=0)
+        e_neg = E_apply({"params": eparams}, x, cond_neg)
+        losses.append(jnp.logaddexp(0.0, e_pos - e_neg))
+    return jnp.mean(jnp.stack(losses, 0))
 
 
 @jax.jit
-def energy_train_step(est: EnergyState, E_apply, imgs, m_emb):
+def energy_train_step(state: EnergyState, x, cond_vec):
     def loss_fn(params):
-        # simple NCE-ish: push matched lower than rolled negatives
-        e_pos = E_apply({"params": params}, imgs, m_emb)  # (B,)
-        loss = 0.0
-        K = 4
-        for k in range(1, K + 1):
-            e_neg = E_apply({"params": params}, imgs, jnp.roll(m_emb, k, axis=0))
-            loss += jnp.mean(jnp.logaddexp(0.0, e_pos - e_neg))
-        return loss / K
+        return energy_contrastive_loss(state.train.apply_fn, params, x, cond_vec)
 
-    loss, grads = jax.value_and_grad(loss_fn)(est.params)
-    est = est.apply_gradients(grads=grads)
-    return est, loss
+    loss, grads = jax.value_and_grad(loss_fn)(state.train.params)
+    new_train = state.train.apply_gradients(grads=grads)
+    new_state = dc_replace(state, train=new_train)
+    return new_state, loss
