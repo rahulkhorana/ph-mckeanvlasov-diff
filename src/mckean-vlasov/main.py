@@ -57,7 +57,7 @@ def main():
     cond_dim = 256 + num_classes  # modules (256) + one-hot label
 
     # --- UNet init ---
-    unet = UNet3D_FiLM(ch=64, depth=3, cond_dim=cond_dim)
+    unet = UNet3D_FiLM(ch=64)
     x_d = jnp.zeros((args.batch, H, W, K, C), jnp.float32)
     t_d = jnp.zeros((args.batch,), jnp.float32)
     temb_d = time_embed(t_d, 128)
@@ -100,7 +100,7 @@ def main():
         # diffusion step
         key, rng = jax.random.split(rng)
         diff_state, dloss = diffusion_train_step(
-            diff_state, vol, cond_train, key, v_prediction=diff_state.v_prediction
+            diff_state, vol, cond_train, key, v_prediction=bool(diff_state.v_prediction)
         )
 
         # energy step (no dropout)
@@ -141,7 +141,7 @@ def main():
         cond_vec=cond_ref,
         steps=200,
         rng=jax.random.PRNGKey(123),
-        v_prediction=diff_state.v_prediction,
+        v_prediction=bool(diff_state.v_prediction),
         bridge_fn=bridge,
         bridge_scale=1.0,
         return_all=False,

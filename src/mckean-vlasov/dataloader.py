@@ -6,26 +6,37 @@ import torch
 # ---------- load & reshape ----------
 
 
-def load_packed_pt(path: str, require_modules: bool = True) -> Dict[str, Any]:
+def load_packed_pt(path: str, require_modules: bool = True):
     pack = torch.load(path, map_location="cpu")
-    # landscapes: (N, 3, KS, H, W) float16
-    lands = pack["landscapes"].float().numpy()  # (N,3,KS,H,W) -> float32
-    N, D, KS, H, W = lands.shape
-    # NHWKC with C=3(degrees), K=KS (depth)
-    vol = np.transpose(lands, (0, 3, 4, 2, 0))  # (N, H, W, KS, 3)
-    labels = np.array(pack["labels"].numpy(), dtype=np.int32)  # (N,)
-    modules = pack["modules"]  # list length N; each is list of tensors/arrays
+
+    lands_t = pack["landscapes"]  # (N, 3, KS, H, W) torch.float16
+    lands = lands_t.cpu().numpy().astype(np.float32)
+
+    # correct permutation: (N, H, W, KS, 3)
+    vol = np.transpose(lands, (0, 3, 4, 2, 1))
+
+    modules = pack["modules"]
     if require_modules and (modules is None):
-        raise ValueError("Dataset has no 'modules'. Regenerate with KEEP_MODULES=1.")
+        raise ValueError("Dataset has no modules but require_modules=True")
+
+    pcs = pack["pcs"].cpu().numpy().astype(np.float32)  # (N, 100, 6)
+    labels = pack["labels"].cpu().numpy().astype(np.int64)  # (N,)
+    meta = pack["meta"]
+    label_map = pack["label_map"]
+    KS = lands.shape[2]  # from (N, 3, KS, H, W)
+    degrees = 3  # H0/H1/H2
+    res = int(meta.get("landscape_res", lands.shape[-1]))  # H (== W)
+
     return {
-        "vol": vol.astype(np.float32),  # (N,H,W,K,C)
+        "vol": vol,  # (N, H, W, KS, 3)
+        "pcs": pcs,  # (N, 100, 6)
         "labels": labels,  # (N,)
-        "modules": modules,  # ragged python list
-        "label_map": pack["label_map"],
-        "meta": pack["meta"],
+        "modules": modules,  # list of lists of tensors
+        "meta": meta,
+        "label_map": label_map,
         "KS": KS,
-        "degrees": D,
-        "res": H,
+        "degrees": degrees,
+        "res": res,
     }
 
 

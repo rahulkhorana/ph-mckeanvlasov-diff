@@ -210,18 +210,6 @@ def build_modules_embedder(rng, out_dim: int = 256, T_max: int = 1, S_max: int =
 
 
 # ---------- FiLM UNet-3D ----------
-class FiLM(nn.Module):
-    out_ch: int
-
-    @nn.compact
-    def __call__(self, h, cond_vec):  # h: (B,H,W,K,C)
-        g = nn.swish(nn.Dense(self.out_ch)(cond_vec))
-        b = nn.swish(nn.Dense(self.out_ch)(cond_vec))
-        g = g[:, None, None, None, :]
-        b = b[:, None, None, None, :]
-        return h * (1.0 + g) + b
-
-
 class ResBlock3D(nn.Module):
     ch: int
 
@@ -239,48 +227,121 @@ class ResBlock3D(nn.Module):
         return x + h
 
 
-class UNet3D_FiLM(nn.Module):
-    ch: int = 64
-    depth: int = 3  # number of downs
-    cond_dim: int = 256  # modules(256) + labels(one-hot) size — set at runtime
+def _pool_hw(x):  # pool only H,W; keep K
+    return nn.max_pool(x, window_shape=(2, 2, 1), strides=(2, 2, 1), padding="SAME")
+
+
+def _up_hw(x, features):
+    return nn.ConvTranspose(
+        features=features, kernel_size=(2, 2, 1), strides=(2, 2, 1), padding="SAME"
+    )(x)
+
+
+def _safe_gn_groups(channels: int) -> int:
+    # Use 8 if divisible, else fallback to 4 or 1
+    if channels % 8 == 0:
+        return 8
+    if channels % 4 == 0:
+        return 4
+    return 1
+
+
+class Res3D(nn.Module):
+    feat: int
 
     @nn.compact
-    def __call__(self, x, t_emb: jnp.ndarray, cond_vec: jnp.ndarray):
+    def __call__(self, x):
+        ch_in = x.shape[-1]
+
+        # GN over current channels (e.g., 3 at the very start) with a safe group count
+        g1 = _safe_gn_groups(ch_in)
+        h = nn.GroupNorm(num_groups=g1)(x)
+        h = nn.swish(h)
+        h = nn.Conv(self.feat, kernel_size=(3, 3, 3), padding="SAME")(h)
+
+        # Now channels == feat; we can use a stable group count for 'feat'
+        g2 = _safe_gn_groups(self.feat)
+        h = nn.GroupNorm(num_groups=g2)(h)
+        h = nn.swish(h)
+        h = nn.Conv(self.feat, kernel_size=(3, 3, 3), padding="SAME")(h)
+
+        # Skip: project if input channels != feat
+        skip = x
+        if ch_in != self.feat:
+            skip = nn.Conv(self.feat, kernel_size=(1, 1, 1))(skip)
+
+        return skip + h
+
+
+class FiLM(nn.Module):
+    feat: int
+
+    @nn.compact
+    def __call__(self, h, cond_vec):
         """
-        x: (B,H,W,K,C)   t_emb: (B,128)   cond_vec: (B,cond_dim)
-        returns epsilon or v with same channel count as x (C)
+        h: (B,H,W,K,feat)
+        cond_vec: (B, D)
         """
-        # fuse time into cond
-        t_h = nn.swish(nn.Dense(self.cond_dim)(t_emb))
-        c = jnp.concatenate([cond_vec, t_h], axis=-1)
-        c = nn.swish(nn.Dense(self.cond_dim)(c))  # final cond vector
+        gamma_beta = nn.Dense(2 * self.feat)(cond_vec)  # (B,2F)
+        gamma, beta = jnp.split(gamma_beta, 2, axis=-1)  # (B,F),(B,F)
+        gamma = gamma[:, None, None, None, :]
+        beta = beta[:, None, None, None, :]
+        return h * (1.0 + gamma) + beta
 
-        # encoder
-        hs = []
-        h = nn.Conv(self.ch, (3, 3, 3), padding="SAME")(x)
-        h = ResBlock3D(self.ch)(h, c)
-        hs.append(h)
-        # downsample only H,W (keep K)
-        ch = self.ch
-        for _ in range(self.depth - 1):
-            h = nn.max_pool(
-                h, window_shape=(2, 2, 1), strides=(2, 2, 1), padding="SAME"
-            )
-            ch *= 2
-            h = ResBlock3D(ch)(h, c)
-            hs.append(h)
 
-        # bottleneck
-        h = ResBlock3D(ch * 2)(nn.Conv(ch * 2, (3, 3, 3), padding="SAME")(h), c)
+# ---------------- UNet3D with REQUIRED conditioning ----------------
+class UNet3D_FiLM(nn.Module):
+    ch: int = 64  # base channels
 
-        # decoder
-        for skip in hs[::-1]:
-            h = nn.ConvTranspose(ch, kernel_size=(2, 2, 1), strides=(2, 2, 1))(h)
-            h = jnp.concatenate([h, skip], axis=-1)
-            h = ResBlock3D(ch)(h, c)
-            ch //= 2 if ch > self.ch else self.ch
-        eps = nn.Conv(x.shape[-1], (1, 1, 1))(h)
-        return eps
+    @nn.compact
+    def __call__(self, x, t_emb, m_emb, y_emb=None):
+        """
+        x:     (B,H,W,K,C)
+        t_emb: (B,Dt) REQUIRED (use time_embed)
+        m_emb: (B,Dm) REQUIRED (your modules encoder)
+        y_emb: (B,Dy) OPTIONAL (label embedding from your caller)
+
+        returns: (B,H,W,K,C) epsilon (or v) prediction
+        """
+        assert (
+            t_emb is not None and m_emb is not None
+        ), "UNet3D_FiLM requires t_emb and m_emb."
+        B, H, W, K, C = x.shape
+
+        cond = jnp.concatenate(
+            [t_emb, m_emb] + ([y_emb] if y_emb is not None else []), axis=-1
+        )
+        # project cond once so dims are stable
+        cond = nn.Dense(256)(cond)
+        cond = nn.swish(cond)
+
+        # ---------- Down path ----------
+        h1 = Res3D(self.ch)(x)
+        h1 = FiLM(self.ch)(h1, cond)  # (B,128,128,3,64)
+        d1 = _pool_hw(h1)  # (B,64,64,3,64)
+
+        h2 = Res3D(self.ch * 2)(d1)
+        h2 = FiLM(self.ch * 2)(h2, cond)  # (B,64,64,3,128)
+        d2 = _pool_hw(h2)  # (B,32,32,3,128)
+
+        h3 = Res3D(self.ch * 4)(d2)
+        h3 = FiLM(self.ch * 4)(h3, cond)  # (B,32,32,3,256)
+
+        # ---------- Up path ----------
+        u2 = _up_hw(h3, self.ch * 2)  # (B,64,64,3,128)
+        assert u2.shape[1:4] == h2.shape[1:4], f"u2 {u2.shape} vs h2 {h2.shape}"
+        u2 = jnp.concatenate([u2, h2], axis=-1)  # (B,64,64,3,256)
+        u2 = Res3D(self.ch * 2)(u2)
+        u2 = FiLM(self.ch * 2)(u2, cond)
+
+        u1 = _up_hw(u2, self.ch)  # (B,128,128,3,64)
+        assert u1.shape[1:4] == h1.shape[1:4], f"u1 {u1.shape} vs h1 {h1.shape}"
+        u1 = jnp.concatenate([u1, h1], axis=-1)  # (B,128,128,3,128)
+        u1 = Res3D(self.ch)(u1)
+        u1 = FiLM(self.ch)(u1, cond)
+
+        out = nn.Conv(C, kernel_size=(1, 1, 1))(u1)  # (B,H,W,K,C)
+        return out
 
 
 # ---------- Energy network on volumes ----------
