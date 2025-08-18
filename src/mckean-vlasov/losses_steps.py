@@ -196,47 +196,85 @@ def diffusion_train_step(
     return state.replace(params=new_params, opt_state=new_opt, ema_params=new_ema), loss
 
 
-# ----- energy losses (now conditioner-aware) -----
-def _pairwise_energy_matrix(E_apply, eparams, L: jnp.ndarray, cond_mat: jnp.ndarray):
+# ===== energy loss: K-negatives NT-Xent (O(B·K) instead of O(B²)) =====
+
+
+def _energy_logits_row(E_apply, eparams, Li, cond_mat, neg_idx_i):
     """
-    E_ij = E(L_i, cond_j).
+    For one sample i:
+      Li:          (H,W,KS,3)
+      cond_mat:    (B,D)
+      neg_idx_i:   (K,)
+    Build candidates conds: [cond_i] + cond[neg_idx_i] -> (K+1,D),
+    replicate Li -> (K+1,H,W,KS,3), evaluate energies -> logits_i = -E/tau elsewhere.
+    """
+    pos = cond_mat[0]  # we'll pass cond_mat so that index 0 is pos via a gather trick
+    # But we want cond_i specifically, so we gather it outside and pass here as first row.
+
+    # This function expects 'cond_mat' already stacked as (K+1, D) = [pos; negs]
+    # So just broadcast Li to match that K+1.
+    K1 = cond_mat.shape[0]
+    Li_rep = jnp.broadcast_to(Li[None, ...], (K1,) + Li.shape)  # (K+1, H,W,KS,3)
+    E = E_apply({"params": eparams}, Li_rep, cond_mat)  # (K+1,)
+    return E  # caller does scaling / CE
+
+
+def energy_ntxent_k(E_apply, eparams, L, cond_mat, neg_idx, tau: float):
+    """
+    K-negative NT-Xent:
       L:        (B,H,W,KS,3)
-      cond_mat: (B,D)  (e.g., concat[y_emb, m_emb])
-    Returns (B,B). No dynamic slicing.
+      cond_mat: (B,D)
+      neg_idx:  (B,K) integer indices into cond_mat (negatives for each i)
+    returns scalar loss
     """
     B = L.shape[0]
+    K = neg_idx.shape[1]
 
-    def row_energy(Li):
-        LiB = jnp.broadcast_to(Li[None, ...], (B,) + L.shape[1:])  # (B,H,W,KS,3)
-        return E_apply({"params": eparams}, LiB, cond_mat)  # (B,)
+    def per_i(i):
+        # gather positive and negatives for this i
+        pos = cond_mat[i]  # (D,)
+        negs = jnp.take(cond_mat, neg_idx[i], axis=0)  # (K,D)
+        cand = jnp.concatenate([pos[None, :], negs], axis=0)  # (K+1, D)
 
-    return jax.vmap(row_energy, in_axes=0)(L)  # (B,B)
+        Ei = _energy_logits_row(E_apply, eparams, L[i], cand, neg_idx[i])  # (K+1,)
+        logits = -Ei / tau
+        # label is 0 (the positive is first)
+        loss_i = optax.softmax_cross_entropy_with_integer_labels(
+            logits[None, :], jnp.array([0], dtype=jnp.int32)
+        )
+        return loss_i.squeeze()
+
+    losses = jax.vmap(per_i)(jnp.arange(B, dtype=jnp.int32))
+    return losses.mean()
 
 
-def energy_ntxent(E_apply, eparams, L, cond_mat, tau: float):
-    Eij = _pairwise_energy_matrix(E_apply, eparams, L, cond_mat)  # (B,B)
-    logits = -Eij / tau
-    labels = jnp.arange(L.shape[0], dtype=jnp.int32)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-    return loss
+def energy_grad_penalty_diag(E_apply, eparams, L, cond_mat):
+    """
+    Gradient penalty on the positive diagonal pairs only:
+      mean_i E(L_i, cond_i)
+    """
 
-
-def energy_grad_penalty(E_apply, eparams, L, cond_mat):
-    def e_mean(L_):
+    def e_mean_diag(L_):
         return E_apply({"params": eparams}, L_, cond_mat).mean()
 
-    g = jax.grad(e_mean)(L)
+    g = jax.grad(e_mean_diag)(L)  # same shapes as L
     return (g * g).mean()
 
 
-# -------- split energy step: arrays-only jitted E-step + host encoder step --------
 @jax.jit
-def energy_step_E(e_state: EnergyState, L: jnp.ndarray, cond_mat: jnp.ndarray):
-    """JIT-safe update of the energy network; only array arguments."""
+def energy_step_E(
+    e_state: EnergyState,
+    L: jnp.ndarray,  # (B,H,W,KS,3)
+    cond_mat: jnp.ndarray,  # (B,D)
+    neg_idx: jnp.ndarray,  # (B,K) int32
+):
+    """JIT-safe update of the energy network using K-negatives NT-Xent."""
 
     def loss_e(eparams):
-        ce = energy_ntxent(e_state.apply_fn, eparams, L, cond_mat, tau=e_state.tau)
-        gp = e_state.gp_lambda * energy_grad_penalty(
+        ce = energy_ntxent_k(
+            e_state.apply_fn, eparams, L, cond_mat, neg_idx, tau=e_state.tau
+        )
+        gp = e_state.gp_lambda * energy_grad_penalty_diag(
             e_state.apply_fn, eparams, L, cond_mat
         )
         return ce + gp
@@ -253,20 +291,21 @@ def energy_step_encoder(
     e_apply: Callable,
     eparams: FrozenDict,
     mods_embed_fn,  # (enc_params, mods_batch) -> (B, Dm)
-    mods_batch,  # ragged list; stay on host
+    mods_batch,  # ragged list on host
     y_emb: jnp.ndarray,  # (B, Dy)
-    L: jnp.ndarray,
+    L: jnp.ndarray,  # (B,H,W,KS,3)
+    neg_idx: jnp.ndarray,  # (B,K)
     tau: float,
 ):
     """
-    Non-jitted encoder update (mods_batch is Python/ragged).
-    Recomputes conditioner as concat[y_emb, m_emb(enc_params)] to keep dims consistent.
+    Host-side encoder update (ragged mods). Recomputes the conditioner with current enc_params,
+    then uses the same K-negatives structure to define the loss.
     """
 
     def loss_enc(enc_params):
         m_emb2 = mods_embed_fn(enc_params, mods_batch)  # (B,Dm)
         cond2 = jnp.concatenate([y_emb, m_emb2], axis=-1)  # (B,Dy+Dm)
-        ce = energy_ntxent(e_apply, eparams, L, cond2, tau=tau)
+        ce = energy_ntxent_k(e_apply, eparams, L, cond2, neg_idx, tau=tau)
         return ce
 
     lossEnc, gradsEnc = jax.value_and_grad(loss_enc)(enc_state.params)

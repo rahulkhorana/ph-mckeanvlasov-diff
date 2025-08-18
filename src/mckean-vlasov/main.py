@@ -182,6 +182,7 @@ def main():
         default=-1,
         help="-1 uses batch labels; else forces this class id",
     )
+    ap.add_argument("--energy_neg_k", type=int, default=8)
     args = ap.parse_args()
 
     # ---------------- data ----------------
@@ -297,7 +298,20 @@ def main():
         )
 
         # energy step (if enabled)
-        e_state, eloss_E = energy_step_E(e_state, vol, cond_vec)
+
+        B = vol.shape[0]
+        K = max(1, min(args.energy_neg_k, max(1, B - 1)))
+
+        # build (B,K) negatives on host (no self-index)
+        neg_idx = np.empty((B, K), dtype=np.int32)
+        all_idx = np.arange(B, dtype=np.int32)
+        for i in range(B):
+            pool = np.concatenate([all_idx[:i], all_idx[i + 1 :]])  # exclude i
+            replace = pool.shape[0] < K
+            neg_idx[i] = np.random.choice(pool, size=K, replace=replace)
+        neg_idx = jnp.array(neg_idx)  # send to device
+
+        e_state, eloss_E = energy_step_E(e_state, vol, cond_vec, neg_idx)
         enc_state, eloss_Enc = energy_step_encoder(
             enc_state,
             e_state.apply_fn,
@@ -306,6 +320,7 @@ def main():
             batch["modules"],
             y_emb,
             vol,
+            neg_idx,
             tau=args.energy_tau,
         )
         eloss_value = float(eloss_E + eloss_Enc)
