@@ -1,66 +1,72 @@
-from typing import Any, List, Tuple
 import numpy as np
-import jax.numpy as jnp
 import jax
+import jax.numpy as jnp
 import flax.linen as nn
 from flax.linen import attention as nn_attn
+from typing import Any, List, Tuple
 
 
-# ---------- sinusoidal time embedding (pure fn) ----------
+# ---------------- time embedding (param-free) ----------------
 def time_embed(t_cont: jnp.ndarray, dim: int = 128) -> jnp.ndarray:
     """
-    t_cont: (B,) in [0,1]
-    returns: (B, dim)
+    Param-free sinusoidal embed of continuous time t in [0,1].
+    Returns (B, dim). Safe to call from Python (no flax params).
     """
+    t = t_cont.astype(jnp.float32)
     half = dim // 2
-    freqs = jnp.exp(jnp.linspace(0.0, jnp.log(10000.0), half))
-    ang = t_cont[:, None] * freqs[None, :]
-    emb = jnp.concatenate([jnp.sin(ang), jnp.cos(ang)], axis=-1)
-    if dim % 2 == 1:
-        emb = jnp.pad(emb, ((0, 0), (0, 1)))
+    # geometric frequency range
+    freqs = jnp.exp(jnp.linspace(jnp.log(1.0), jnp.log(10000.0), half))
+    ang = t[:, None] * (1.0 / freqs[None, :])
+    emb = jnp.concatenate([jnp.sin(ang), jnp.cos(ang)], axis=-1)  # (B, 2*half)
+    if emb.shape[-1] < dim:
+        # pad to requested dim
+        emb = jnp.pad(emb, ((0, 0), (0, dim - emb.shape[-1])))
     return emb
 
 
-# ---------- Modules trajectory featurization (stats + sets) ----------
+# ----------- modules trajectory encoder (your version) -----------
 def _robust_stats(arr: np.ndarray) -> np.ndarray:
-    a = np.asarray(arr, dtype=np.float32).ravel()
-    if a.size == 0:
-        return np.zeros(13, dtype=np.float32)
+    a = np.asarray(arr).astype(np.float32)
     finite = np.isfinite(a)
-    fr = float(finite.mean())
-    a = a[finite]
-    if a.size == 0:
-        return np.zeros(13, dtype=np.float32)
-    mean = float(a.mean())
-    std = float(a.std() + 1e-6)
-    q25, q50, q75 = np.percentile(a, [25, 50, 75])
-    mn, mx = float(a.min()), float(a.max())
-    l1 = float(np.abs(a).sum())
-    l2 = float(np.sqrt((a * a).sum()))
-    max_abs = float(np.abs(a).max())
-    logN = float(np.log1p(a.size))
-    skew = float(np.mean(((a - mean) / std) ** 3))
+    fr = float(finite.mean()) if a.size else 0.0
+    a = np.where(finite, a, np.nan)
+    if a.size == 0 or fr == 0.0:
+        return np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fr, 0, 0], dtype=np.float32)
+    mean = np.nanmean(a)
+    std = np.nanstd(a)
+    q25, q50, q75 = np.nanpercentile(a, [25, 50, 75])
+    mn, mx = np.nanmin(a), np.nanmax(a)
+    l1 = np.nansum(np.abs(a))
+    l2 = float(np.sqrt(np.nansum(a * a)))
+    max_abs = float(np.nanmax(np.abs(a)))
+    numel = float(a.size)
+    log_numel = float(np.log1p(numel))
+    centered = a - mean
+    m3 = np.nanmean(centered**3)
+    skew = float(m3 / (std**3 + 1e-6))
     return np.array(
-        [mean, std, mn, mx, q25, q50, q75, l1, l2, logN, fr, max_abs, skew], np.float32
+        [mean, std, mn, mx, q25, q50, q75, l1, l2, log_numel, fr, max_abs, skew],
+        dtype=np.float32,
     )
 
 
 def featurize_modules_trajectory(
-    mods_traj: List[List[Any]],
+    mods_trajectory: List[List[Any]],
     T_max: int = 1,
     S_max: int = 16,
     add_pos_ids: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    mods_traj: length-T list; each item is a list of tensors at that time.
+    mods_trajectory: list length T of (list of module arrays/tensors)
     Returns:
-      feats     (T_max,S_max,F)
-      set_mask  (T_max,S_max,1)
-      time_mask (T_max,1)
+      feats:     (T_max, S_max, F)
+      set_mask:  (T_max, S_max, 1)
+      time_mask: (T_max, 1)
+    NOTE: caller will batch these into (B,T,S,F) etc.
     """
-    traj = mods_traj[:T_max]
+    traj = mods_trajectory[:T_max]
     T = len(traj)
-    slices, masks = [], []
+    feat_slices, set_masks = [], []
     for t in range(T_max):
         if t < T:
             elems = traj[t][:S_max]
@@ -68,34 +74,39 @@ def featurize_modules_trajectory(
             for i, e in enumerate(elems):
                 f = _robust_stats(np.array(e))
                 if add_pos_ids:
-                    oh = np.zeros((S_max,), np.float32)
+                    oh = np.zeros((S_max,), dtype=np.float32)
                     oh[min(i, S_max - 1)] = 1.0
-                    f = np.concatenate([f, oh], -1)
+                    f = np.concatenate([f, oh], axis=0)
                 row.append(f)
-            if not row:
+            if len(row) == 0:
                 F = 13 + (S_max if add_pos_ids else 0)
-                row = [np.zeros((F,), np.float32)]
+                row = [np.zeros((F,), dtype=np.float32)]
             F = row[0].shape[0]
             if len(row) < S_max:
-                row += [np.zeros((F,), np.float32)] * (S_max - len(row))
-            slices.append(np.stack(row, 0))
-            valid = min(len(traj[t]), S_max)
-            masks.append(
-                np.array([1.0] * valid + [0.0] * (S_max - valid), np.float32)[:, None]
+                row += [np.zeros((F,), dtype=np.float32)] * (S_max - len(row))
+            feat_slices.append(np.stack(row, axis=0))
+            set_masks.append(
+                np.array(
+                    [1.0] * min(len(traj[t]), S_max)
+                    + [0.0] * (S_max - min(len(traj[t]), S_max))
+                )[:, None]
             )
         else:
-            F = slices[0].shape[1] if slices else 13 + (S_max if add_pos_ids else 0)
-            slices.append(np.zeros((S_max, F), np.float32))
-            masks.append(np.zeros((S_max, 1), np.float32))
-    feats = jnp.array(np.stack(slices, 0))
-    set_mask = jnp.array(np.stack(masks, 0))
-    time_mask = jnp.array(
-        np.array([1.0] * T + [0.0] * (T_max - T), np.float32)[:, None]
-    )
+            F = (
+                feat_slices[0].shape[1]
+                if feat_slices
+                else (13 + (S_max if add_pos_ids else 0))
+            )
+            feat_slices.append(np.zeros((S_max, F), dtype=np.float32))
+            set_masks.append(np.zeros((S_max, 1), dtype=np.float32))
+    feats = jnp.array(np.stack(feat_slices, axis=0))  # (T_max,S_max,F)
+    set_mask = jnp.array(np.stack(set_masks, axis=0))  # (T_max,S_max,1)
+    time_mask = jnp.array(np.array([1.0] * T + [0.0] * (T_max - T), dtype=np.float32))[
+        :, None
+    ]  # (T_max,1)
     return feats, set_mask, time_mask
 
 
-# ---------- Set/Time encoders ----------
 class MHA(nn.Module):
     d: int
     h: int = 4
@@ -109,10 +120,12 @@ class MHA(nn.Module):
         q = nn.Dense(self.d)(qx)
         k = nn.Dense(self.d)(kx)
         v = nn.Dense(self.d)(vx)
-        mask = None
+        attn_mask = None
         if (q_mask is not None) and (k_mask is not None):
-            mask = nn_attn.make_attention_mask(q_mask, k_mask)
-        return nn.MultiHeadDotProductAttention(num_heads=self.h)(q, k, v, mask=mask)
+            attn_mask = nn_attn.make_attention_mask(q_mask, k_mask)
+        return nn.MultiHeadDotProductAttention(num_heads=self.h)(
+            q, k, v, mask=attn_mask
+        )
 
 
 class SAB(nn.Module):
@@ -122,9 +135,13 @@ class SAB(nn.Module):
     @nn.compact
     def __call__(self, x, key_mask=None):
         B, S, _ = x.shape
-        k_mask = (key_mask[..., 0] > 0) if (key_mask is not None) else None
-        q_mask = jnp.ones((B, S), dtype=bool)
-        y = MHA(self.d, self.h)(x, None, None, q_mask=q_mask, k_mask=k_mask)
+        k_mask_bool = None
+        if key_mask is not None:
+            k_mask_bool = (
+                (key_mask[..., 0] > 0) if key_mask.ndim == 3 else key_mask.astype(bool)
+            )
+        q_mask_bool = jnp.ones((B, S), dtype=bool)
+        y = MHA(self.d, self.h)(x, None, None, q_mask=q_mask_bool, k_mask=k_mask_bool)
         x = x + y
         x = x + nn.Dense(self.d)(nn.gelu(nn.Dense(self.d * 4)(x)))
         return x
@@ -138,11 +155,17 @@ class PMA(nn.Module):
     @nn.compact
     def __call__(self, x, key_mask=None):
         B, S, d = x.shape
-        seeds = self.param("seed", nn.initializers.normal(0.02), (self.m, self.d))
-        q = jnp.repeat(seeds[None, :, :], B, 0)  # (B,m,d)
-        k_mask = (key_mask[..., 0] > 0) if (key_mask is not None) else None
-        q_mask = jnp.ones((B, self.m), dtype=bool)
-        return MHA(self.d, self.h)(q, x, x, q_mask=q_mask, k_mask=k_mask)
+        seeds = self.param(
+            "seed", nn.initializers.normal(stddev=0.02), (self.m, self.d)
+        )
+        q = jnp.repeat(seeds[None, :, :], B, axis=0)  # (B,m,d)
+        k_mask_bool = None
+        if key_mask is not None:
+            k_mask_bool = (
+                (key_mask[..., 0] > 0) if key_mask.ndim == 3 else key_mask.astype(bool)
+            )
+        q_mask_bool = jnp.ones((B, self.m), dtype=bool)
+        return MHA(self.d, self.h)(q, x, x, q_mask=q_mask_bool, k_mask=k_mask_bool)
 
 
 class ModulesTrajectoryEncoder(nn.Module):
@@ -157,9 +180,7 @@ class ModulesTrajectoryEncoder(nn.Module):
     deterministic: bool = True
 
     @nn.compact
-    def __call__(
-        self, feats: jnp.ndarray, set_mask: jnp.ndarray, time_mask: jnp.ndarray
-    ):
+    def __call__(self, feats, set_mask, time_mask):
         B, T, S, F = feats.shape
         x = feats.reshape(B * T, S, F)
         m = set_mask.reshape(B * T, S, 1)
@@ -169,8 +190,13 @@ class ModulesTrajectoryEncoder(nn.Module):
         x = PMA(self.d_set, m=self.m_pma, h=self.heads)(x, key_mask=m).squeeze(1)
         x = x.reshape(B, T, self.d_set)
         x = nn.Dense(self.d_time)(x)
-        tmask = time_mask.squeeze(-1) > 0
-        attn_mask = nn_attn.make_attention_mask(tmask, tmask)
+
+        tmask_bool = (
+            (time_mask.squeeze(-1) > 0)
+            if time_mask.ndim == 3
+            else time_mask.astype(bool)
+        )
+        attn_mask = nn_attn.make_attention_mask(tmask_bool, tmask_bool)
         for _ in range(self.n_layers_time):
             h = nn.LayerNorm()(x)
             y = nn.SelfAttention(num_heads=self.heads, qkv_features=self.d_time)(
@@ -180,99 +206,101 @@ class ModulesTrajectoryEncoder(nn.Module):
             h = nn.LayerNorm()(x)
             y = nn.Dense(self.d_time)(nn.gelu(nn.Dense(self.d_time * 4)(h)))
             x = x + y
+
         denom = jnp.clip(jnp.sum(time_mask, axis=1), 1e-6, None)
         x_mean = jnp.sum(x * time_mask, axis=1) / denom
         z = nn.Dense(self.out_dim)(nn.gelu(nn.Dense(self.out_dim)(x_mean)))
-        return z  # (B,out_dim)
+        return z
 
 
-def build_modules_embedder(rng, out_dim: int = 256, T_max: int = 1, S_max: int = 16):
-    enc = ModulesTrajectoryEncoder(out_dim=out_dim)
-    F = 13 + S_max
-    feats = jnp.zeros((1, T_max, S_max, F), jnp.float32)
-    set_m = jnp.zeros((1, T_max, S_max, 1), jnp.float32)
-    tim_m = jnp.ones((1, T_max, 1), jnp.float32)
-    params = enc.init(rng, feats, set_m, tim_m)["params"]
-
-    def embed_fn(mods_batch: List[Any]) -> jnp.ndarray:
-        feats_list, set_list, time_list = [], [], []
-        for mods in mods_batch:
-            f, s, t = featurize_modules_trajectory([mods], T_max=T_max, S_max=S_max)
-            feats_list.append(f)
-            set_list.append(s)
-            time_list.append(t)
-        Fb = jnp.stack(feats_list, 0)
-        Sb = jnp.stack(set_list, 0)
-        Tb = jnp.stack(time_list, 0)
-        return enc.apply({"params": params}, Fb, Sb, Tb)  # type: ignore (B,out_dim)
-
-    return embed_fn
+# ---------------- 3D blocks + UNet FiLM ----------------
 
 
-# ---------- FiLM UNet-3D ----------
-class ResBlock3D(nn.Module):
-    ch: int
-
-    @nn.compact
-    def __call__(self, x, cond_vec):
-        h = nn.GroupNorm(num_groups=8)(x)
-        h = nn.swish(h)
-        h = nn.Conv(self.ch, (3, 3, 3), padding="SAME")(h)
-        h = FiLM(self.ch)(h, cond_vec)
-        h = nn.GroupNorm(num_groups=8)(h)
-        h = nn.swish(h)
-        h = nn.Conv(self.ch, (3, 3, 3), padding="SAME")(h)
-        if x.shape[-1] != self.ch:
-            x = nn.Conv(self.ch, (1, 1, 1))(x)
-        return x + h
-
-
-def _pool_hw(x):  # pool only H,W; keep K
-    return nn.max_pool(x, window_shape=(2, 2, 1), strides=(2, 2, 1), padding="SAME")
-
-
-def _up_hw(x, features):
-    return nn.ConvTranspose(
-        features=features, kernel_size=(2, 2, 1), strides=(2, 2, 1), padding="SAME"
-    )(x)
-
-
-def _safe_gn_groups(channels: int) -> int:
-    # Use 8 if divisible, else fallback to 4 or 1
-    if channels % 8 == 0:
-        return 8
-    if channels % 4 == 0:
-        return 4
+def _gn_groups(c: int) -> int:
+    """Choose a GroupNorm group count that divides channels c."""
+    for g in (8, 4, 2, 1):
+        if c % g == 0:
+            return g
     return 1
 
 
 class Res3D(nn.Module):
-    feat: int
+    features: int
 
     @nn.compact
-    def __call__(self, x):
-        ch_in = x.shape[-1]
-
-        # GN over current channels (e.g., 3 at the very start) with a safe group count
-        g1 = _safe_gn_groups(ch_in)
+    def __call__(self, x, gamma=None, beta=None):
+        c1 = x.shape[-1]
+        g1 = _gn_groups(c1)
         h = nn.GroupNorm(num_groups=g1)(x)
         h = nn.swish(h)
-        h = nn.Conv(self.feat, kernel_size=(3, 3, 3), padding="SAME")(h)
+        h = nn.Conv(self.features, (3, 3, 3), (1, 1, 1), padding="SAME")(h)
 
-        # Now channels == feat; we can use a stable group count for 'feat'
-        g2 = _safe_gn_groups(self.feat)
+        c2 = h.shape[-1]
+        g2 = _gn_groups(c2)
         h = nn.GroupNorm(num_groups=g2)(h)
         h = nn.swish(h)
-        h = nn.Conv(self.feat, kernel_size=(3, 3, 3), padding="SAME")(h)
+        h = nn.Conv(self.features, (3, 3, 3), (1, 1, 1), padding="SAME")(h)
 
-        # Skip: project if input channels != feat
-        skip = x
-        if ch_in != self.feat:
-            skip = nn.Conv(self.feat, kernel_size=(1, 1, 1))(skip)
+        if (gamma is not None) and (beta is not None):
+            h = h * (1.0 + gamma) + beta
 
-        return skip + h
+        if x.shape[-1] != self.features:
+            x = nn.Conv(self.features, (1, 1, 1))(x)
+
+        return x + h
 
 
+class UNet3D_FiLM(nn.Module):
+    """
+    Conditional 3D UNet with FiLM conditioning from concatenated [t_emb, cond_vec].
+    Input/Output: (B, H, W, K, C)
+    Downsample H,W by 2 twice (K untouched), then upsample with ConvTranspose.
+    """
+
+    ch: int = 64
+
+    @nn.compact
+    def __call__(self, x, t_emb, cond_vec):
+        B, H, W, K, C = x.shape
+        hcond = jnp.concatenate([t_emb, cond_vec], axis=-1)
+
+        # FiLM scales/biases for three stages
+        g1 = nn.Dense(self.ch)(hcond)[:, None, None, None, :]
+        b1 = nn.Dense(self.ch)(hcond)[:, None, None, None, :]
+        g2 = nn.Dense(self.ch * 2)(hcond)[:, None, None, None, :]
+        b2 = nn.Dense(self.ch * 2)(hcond)[:, None, None, None, :]
+        g3 = nn.Dense(self.ch * 4)(hcond)[:, None, None, None, :]
+        b3 = nn.Dense(self.ch * 4)(hcond)[:, None, None, None, :]
+
+        # encoder
+        h1 = Res3D(self.ch)(x, g1, b1)  # (B,H,W,K,ch)
+        d1 = nn.max_pool(h1, window_shape=(2, 2, 1), strides=(2, 2, 1), padding="SAME")
+        h2 = Res3D(self.ch * 2)(d1, g2, b2)  # (B,H/2,W/2,K,2ch)
+        d2 = nn.max_pool(h2, window_shape=(2, 2, 1), strides=(2, 2, 1), padding="SAME")
+        h3 = Res3D(self.ch * 4)(d2, g3, b3)  # (B,H/4,W/4,K,4ch)
+
+        # decoder
+        u2 = nn.ConvTranspose(self.ch * 2, kernel_size=(2, 2, 1), strides=(2, 2, 1))(h3)
+        if (u2.shape[1] != h2.shape[1]) or (u2.shape[2] != h2.shape[2]):
+            u2 = jax.image.resize(
+                u2, (B, h2.shape[1], h2.shape[2], K, u2.shape[-1]), method="nearest"
+            )
+        u2 = jnp.concatenate([u2, h2], axis=-1)
+        u2 = Res3D(self.ch * 2)(u2, g2, b2)
+
+        u1 = nn.ConvTranspose(self.ch, kernel_size=(2, 2, 1), strides=(2, 2, 1))(u2)
+        if (u1.shape[1] != h1.shape[1]) or (u1.shape[2] != h1.shape[2]):
+            u1 = jax.image.resize(
+                u1, (B, h1.shape[1], h1.shape[2], K, u1.shape[-1]), method="nearest"
+            )
+        u1 = jnp.concatenate([u1, h1], axis=-1)
+        u1 = Res3D(self.ch)(u1, g1, b1)
+
+        # final head: predict eps or v
+        return nn.Conv(C, (1, 1, 1))(u1)
+
+
+# ---------- Energy network on volumes (FiLM) ----------
 class FiLM(nn.Module):
     feat: int
 
@@ -289,65 +317,31 @@ class FiLM(nn.Module):
         return h * (1.0 + gamma) + beta
 
 
-# ---------------- UNet3D with REQUIRED conditioning ----------------
-class UNet3D_FiLM(nn.Module):
-    ch: int = 64  # base channels
+class ResBlock3D(nn.Module):
+    ch: int
 
     @nn.compact
-    def __call__(self, x, t_emb, m_emb, y_emb=None):
-        """
-        x:     (B,H,W,K,C)
-        t_emb: (B,Dt) REQUIRED (use time_embed)
-        m_emb: (B,Dm) REQUIRED (your modules encoder)
-        y_emb: (B,Dy) OPTIONAL (label embedding from your caller)
+    def __call__(self, x, cond_vec):
+        g1 = _gn_groups(x.shape[-1])
+        h = nn.GroupNorm(num_groups=g1)(x)
+        h = nn.swish(h)
+        h = nn.Conv(self.ch, (3, 3, 3), padding="SAME")(h)
 
-        returns: (B,H,W,K,C) epsilon (or v) prediction
-        """
-        assert (
-            t_emb is not None and m_emb is not None
-        ), "UNet3D_FiLM requires t_emb and m_emb."
-        B, H, W, K, C = x.shape
+        h = FiLM(self.ch)(h, cond_vec)
 
-        cond = jnp.concatenate(
-            [t_emb, m_emb] + ([y_emb] if y_emb is not None else []), axis=-1
-        )
-        # project cond once so dims are stable
-        cond = nn.Dense(256)(cond)
-        cond = nn.swish(cond)
+        g2 = _gn_groups(h.shape[-1])
+        h = nn.GroupNorm(num_groups=g2)(h)
+        h = nn.swish(h)
+        h = nn.Conv(self.ch, (3, 3, 3), padding="SAME")(h)
 
-        # ---------- Down path ----------
-        h1 = Res3D(self.ch)(x)
-        h1 = FiLM(self.ch)(h1, cond)  # (B,128,128,3,64)
-        d1 = _pool_hw(h1)  # (B,64,64,3,64)
-
-        h2 = Res3D(self.ch * 2)(d1)
-        h2 = FiLM(self.ch * 2)(h2, cond)  # (B,64,64,3,128)
-        d2 = _pool_hw(h2)  # (B,32,32,3,128)
-
-        h3 = Res3D(self.ch * 4)(d2)
-        h3 = FiLM(self.ch * 4)(h3, cond)  # (B,32,32,3,256)
-
-        # ---------- Up path ----------
-        u2 = _up_hw(h3, self.ch * 2)  # (B,64,64,3,128)
-        assert u2.shape[1:4] == h2.shape[1:4], f"u2 {u2.shape} vs h2 {h2.shape}"
-        u2 = jnp.concatenate([u2, h2], axis=-1)  # (B,64,64,3,256)
-        u2 = Res3D(self.ch * 2)(u2)
-        u2 = FiLM(self.ch * 2)(u2, cond)
-
-        u1 = _up_hw(u2, self.ch)  # (B,128,128,3,64)
-        assert u1.shape[1:4] == h1.shape[1:4], f"u1 {u1.shape} vs h1 {h1.shape}"
-        u1 = jnp.concatenate([u1, h1], axis=-1)  # (B,128,128,3,128)
-        u1 = Res3D(self.ch)(u1)
-        u1 = FiLM(self.ch)(u1, cond)
-
-        out = nn.Conv(C, kernel_size=(1, 1, 1))(u1)  # (B,H,W,K,C)
-        return out
+        if x.shape[-1] != self.ch:
+            x = nn.Conv(self.ch, (1, 1, 1))(x)
+        return x + h
 
 
-# ---------- Energy network on volumes ----------
 class EnergyNetwork(nn.Module):
     ch: int = 64
-    cond_dim: int = 256
+    cond_dim: int = 256  # D of cond_vec (label emb + modules emb)
 
     @nn.compact
     def __call__(self, x, cond_vec):  # x: (B,H,W,K,C)  cond_vec: (B,cond_dim)
@@ -357,7 +351,7 @@ class EnergyNetwork(nn.Module):
         h = ResBlock3D(self.ch * 2)(h, cond_vec)
         h = nn.max_pool(h, (2, 2, 1), (2, 2, 1), padding="SAME")
         h = ResBlock3D(self.ch * 4)(h, cond_vec)
-        h = jnp.mean(h, axis=(1, 2, 3))  # GAP
+        h = jnp.mean(h, axis=(1, 2, 3))  # global average over H,W,K -> (B, 4ch)
         h = jnp.concatenate([h, cond_vec], axis=-1)
         h = nn.tanh(nn.Dense(256)(h))
         e = nn.Dense(1)(h)
