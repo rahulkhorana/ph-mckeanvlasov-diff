@@ -1,8 +1,9 @@
+# main.py — conditional 3D diffusion on MPL volumes with label+modules conditioning + MV-SDE sampling
 import argparse
 import os
 import json
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Any, Dict
 
 import numpy as np
 import jax
@@ -23,7 +24,8 @@ from losses_steps import (
     create_energy_state,
     create_encoder_state,
     diffusion_train_step,
-    energy_train_step,
+    energy_step_E,
+    energy_step_encoder,
 )
 from sampling import mv_sde_sample, make_energy_guidance
 
@@ -33,10 +35,6 @@ def seed_all(seed: int):
     np.random.seed(seed)
     jax_key = jax.random.PRNGKey(seed)
     return jax_key
-
-
-def one_hot(labels: np.ndarray, num_classes: int) -> jnp.ndarray:
-    return jax.nn.one_hot(jnp.array(labels, dtype=jnp.int32), num_classes=num_classes)
 
 
 def standardize_fit(x: np.ndarray) -> Tuple[float, float]:
@@ -60,7 +58,7 @@ def ensure_dir(p: str | Path):
 # Build a *learnable* modules trajectory encoder wrapper with the signature
 # mods_embed_fn(enc_params, mods_batch) -> (B, out_dim)
 def build_mods_embedder(enc: ModulesTrajectoryEncoder, enc_params):
-    def mods_embed_fn(params, mods_batch: List[List]):
+    def mods_embed_fn(params, mods_batch: List[List[Any]]):
         feats_list, set_list, time_list = [], [], []
         # Wrap each flat list -> trajectory of length 1
         for mods in mods_batch:
@@ -88,6 +86,18 @@ def init_label_proj(rng, num_classes: int, y_dim: int) -> jnp.ndarray:
 def y_embed_from_table(y_table: jnp.ndarray, y_indices: np.ndarray) -> jnp.ndarray:
     # y_indices: (B,)
     return y_table[jnp.array(y_indices, dtype=jnp.int32)]  # (B, y_dim)
+
+
+def infer_num_classes(pack: Dict[str, Any]) -> int:
+    if "labels" in pack:
+        return int(np.asarray(pack["labels"]).max() + 1)
+    lm = pack.get("label_map", None)
+    if isinstance(lm, dict) and len(lm) > 0:
+        try:
+            return int(max(lm.keys()) + 1)
+        except Exception:
+            return int(len(lm))
+    raise ValueError("Could not infer number of classes from pack.")
 
 
 # -------------------------- checkpointing --------------------------
@@ -180,18 +190,16 @@ def main():
     train_ds, val_ds = train_val_split(pack, val_frac=0.1, seed=42)
 
     # features
-    H, W, K, C = train_ds.lands.shape[1:]  # type: ignore (N,H,W,K,C)
-    print(f"N={train_ds.size}  vol=(N,H,W,K,C)=({train_ds.size}, {H}, {W}, {K}, {C})")  # type: ignore
+    H, W, KS, C = train_ds.vol.shape[1:]  # (N,H,W,KS,3)
+    print(f"N={len(train_ds)}  vol=(N,H,W,KS,C)=({len(train_ds)}, {H}, {W}, {KS}, {C})")
 
     # labels / classes
-    num_classes = int(
-        pack["labels"].max() + 1
-    )  # from raw pack to avoid ds API ambiguity
+    num_classes = infer_num_classes(pack)
 
-    # normalization over train
-    mu, sigma = standardize_fit(np.asarray(train_ds.lands))  # type: ignore
+    # normalization (use the full pack to stabilize stats)
+    mu, sigma = standardize_fit(np.asarray(pack["vol"]))  # (N,H,W,KS,3)
 
-    # iterator
+    # iterator (host numpy → we jnp-ify per step)
     train_iter = iterate_batches(
         train_ds, batch_size=args.batch, shuffle=True, seed=args.seed, epochs=None
     )
@@ -217,8 +225,8 @@ def main():
 
     # UNet
     unet = UNet3D_FiLM(ch=64)
-    x_d = jnp.zeros((args.batch, H, W, K, C), jnp.float32)
-    # time embedding is computed inside losses; but we pass placeholders to init
+    x_d = jnp.zeros((args.batch, H, W, KS, C), jnp.float32)
+    # time embedding is computed inside losses or passed (we pass dummy for init)
     t0 = jnp.zeros((args.batch,), jnp.float32)
     t_emb0 = time_embed_fn(t0, 128)
     cond0 = jnp.zeros((args.batch, y_dim + 256), jnp.float32)
@@ -235,20 +243,15 @@ def main():
         ema_decay=args.ema_decay,
     )
 
-    # Energy net (optional)
-    if args.use_energy:
-        E = EnergyNetwork(ch=64, cond_dim=y_dim + 256)
-        E_params = E.init(k_energy, x_d, cond0)["params"]
-        e_state = create_energy_state(
-            E.apply,
-            E_params,
-            lr=args.lr_energy,
-            tau=args.energy_tau,
-            gp_lambda=args.energy_gp,
-        )
-    else:
-        E = None
-        e_state = None
+    E = EnergyNetwork(ch=64, cond_dim=y_dim + 256)
+    E_params = E.init(k_energy, x_d, cond0)["params"]
+    e_state = create_energy_state(
+        E.apply,
+        E_params,
+        lr=args.lr_energy,
+        tau=args.energy_tau,
+        gp_lambda=args.energy_gp,
+    )
 
     # ---------------- output dirs ----------------
     outdir = Path(args.outdir)
@@ -261,46 +264,51 @@ def main():
     for step in range(1, args.steps + 1):
         batch = next(
             train_iter
-        )  # dict with "lands": (B,H,W,K,C), "modules": list len B, "labels": (B,)
-        lands = jnp.array(batch["lands"], dtype=jnp.float32)
-        labels = np.asarray(batch["labels"])
-        lands = standardize_apply(lands, mu, sigma)
+        )  # {"vol": (B,H,W,KS,3), "labels": (B,), "modules": list}
+        vol = jnp.array(batch["vol"], dtype=jnp.float32)  # (B,H,W,KS,3)
+        labels_np = np.asarray(batch["labels"])
+        vol = standardize_apply(vol, mu, sigma)
 
-        # cond vectors
-        y_emb = y_embed_from_table(y_table, labels)  # (B,y_dim)
+        # cond vectors (computed OUTSIDE jit)
+        y_emb = y_embed_from_table(y_table, labels_np)  # (B,y_dim)
         m_emb = mods_embed_fn(enc_state.params, batch["modules"])  # (B,256)
-        cond_vec = jnp.concatenate([y_emb, m_emb], axis=-1)  # type: ignore (B, D)
+        cond_vec = jnp.concatenate(
+            [y_emb, m_emb], axis=-1  # type:ignore (B, y_dim+256)
+        )
 
         # classifier-free dropout on cond
         rng, k_drop = jax.random.split(rng)
         drop_mask = jax.random.bernoulli(
-            k_drop, p=args.cfg_drop, shape=(lands.shape[0], 1)
+            k_drop, p=args.cfg_drop, shape=(vol.shape[0], 1)
         )
         cond_vec_train = jnp.where(drop_mask, jnp.zeros_like(cond_vec), cond_vec)
 
-        # diffusion step (time embedding is constructed inside loss; API expects temb+cond_vec)
-        # We pass dummy temb here to satisfy the signature and compute true t inside loss,
-        # or (if your loss uses passed temb) change your loss to compute temb from sampled t.
-        t_dummy = jnp.zeros((lands.shape[0],), jnp.float32)
-        temb_dummy = time_embed_fn(t_dummy, 128)
+        # diffusion step (temb dummy; loss computes correct time internally or ignore temb)
+        t_dummy = jnp.zeros((vol.shape[0],), jnp.float32)
+        temb = time_embed_fn(t_dummy, 128)
 
         diff_state, dloss = diffusion_train_step(
             diff_state,
-            lands,
-            jax.random.PRNGKey(step),
-            bool(diff_state.v_prediction),
-            temb_dummy,
-            cond_vec_train,
+            vol,
+            rng=jax.random.PRNGKey(step),
+            v_prediction=bool(diff_state.v_prediction),
+            temb=temb,
+            cond_vec=cond_vec_train,
         )
 
         # energy step (if enabled)
-        if e_state is not None:
-            e_state, enc_state, (eloss_E, eloss_Enc) = energy_train_step(
-                e_state, enc_state, mods_embed_fn, lands, batch["modules"]
-            )
-            eloss_value = float(eloss_E + eloss_Enc)
-        else:
-            eloss_value = float(0.0)
+        e_state, eloss_E = energy_step_E(e_state, vol, cond_vec)
+        enc_state, eloss_Enc = energy_step_encoder(
+            enc_state,
+            e_state.apply_fn,
+            e_state.params,
+            mods_embed_fn,
+            batch["modules"],
+            y_emb,
+            vol,
+            tau=args.energy_tau,
+        )
+        eloss_value = float(eloss_E + eloss_Enc)
 
         if step % 20 == 0:
             print(
@@ -330,11 +338,11 @@ def main():
 
         if do_sample:
             # Choose labels for sampling
-            B = lands.shape[0]
+            B = int(vol.shape[0])
             if args.sample_label >= 0:
                 y_idx = np.full((B,), args.sample_label, dtype=np.int32)
             else:
-                y_idx = labels  # last batch labels
+                y_idx = labels_np  # last batch labels
 
             y_emb_s = y_embed_from_table(y_table, y_idx)
             # modules embedding: use encoder on the same batch's modules
@@ -356,7 +364,7 @@ def main():
             samples = mv_sde_sample(
                 unet_apply=diff_state.apply_fn,
                 params=diff_state.ema_params,  # use EMA for sampling
-                shape=(B, H, W, K, C),
+                shape=(B, H, W, KS, C),
                 betas=diff_state.betas,
                 alphas=diff_state.alphas,
                 alpha_bars=diff_state.alpha_bars,
