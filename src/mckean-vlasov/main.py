@@ -284,46 +284,43 @@ def main():
         )
         cond_vec_train = jnp.where(drop_mask, jnp.zeros_like(cond_vec), cond_vec)
 
-        # diffusion step (temb dummy; loss computes correct time internally or ignore temb)
-        t_dummy = jnp.zeros((vol.shape[0],), jnp.float32)
-        temb = time_embed_fn(t_dummy, 128)
-
         diff_state, dloss = diffusion_train_step(
             diff_state,
             vol,
             rng=jax.random.PRNGKey(step),
             v_prediction=bool(diff_state.v_prediction),
-            temb=temb,
             cond_vec=cond_vec_train,
         )
 
         # energy step (if enabled)
-
         B = vol.shape[0]
-        K = max(1, min(args.energy_neg_k, max(1, B - 1)))
 
-        # build (B,K) negatives on host (no self-index)
-        neg_idx = np.empty((B, K), dtype=np.int32)
-        all_idx = np.arange(B, dtype=np.int32)
-        for i in range(B):
-            pool = np.concatenate([all_idx[:i], all_idx[i + 1 :]])  # exclude i
-            replace = pool.shape[0] < K
-            neg_idx[i] = np.random.choice(pool, size=K, replace=replace)
-        neg_idx = jnp.array(neg_idx)  # send to device
+        cond_vec = jnp.concatenate([y_emb, m_emb], axis=-1)  # type: ignore (B, y_dim + d_m)
+        e_state, eloss_E = energy_step_E(e_state, vol, cond_vec, e_state.apply_fn)
 
-        e_state, eloss_E = energy_step_E(e_state, vol, cond_vec, neg_idx)
+        feats_list, set_list, time_list = [], [], []
+        for mods in batch["modules"]:
+            f, s, t = featurize_modules_trajectory([mods], T_max=1, S_max=16)
+            feats_list.append(f)
+            set_list.append(s)
+            time_list.append(t)
+        feats_b = jnp.stack(feats_list, 0)
+        set_b = jnp.stack(set_list, 0)
+        time_b = jnp.stack(time_list, 0)
+
         enc_state, eloss_Enc = energy_step_encoder(
             enc_state,
+            y_emb,
+            feats_b,
+            set_b,
+            time_b,
             e_state.apply_fn,
             e_state.params,
-            mods_embed_fn,
-            batch["modules"],
-            y_emb,
-            vol,
-            neg_idx,
-            tau=args.energy_tau,
+            vol,  # (B,H,W,KS,3)
+            float(e_state.tau),
         )
-        eloss_value = float(eloss_E + eloss_Enc)
+
+        eloss_value = float(eloss_Enc + eloss_E)
 
         if step % 20 == 0:
             print(
