@@ -27,11 +27,8 @@ from losses_steps import (
     create_energy_state,
     create_encoder_state,
     diffusion_train_step,
-    apply_diffusion_updates,
     energy_step_E,
-    apply_energy_updates_E,
     energy_step_encoder,
-    apply_encoder_updates,
 )
 from sampling import mv_sde_sample, make_energy_guidance
 
@@ -284,21 +281,18 @@ def main():
         cond_vec_train = jnp.where(drop_mask, jnp.zeros_like(cond_vec), cond_vec)
 
         # diffusion step
-        diff_state, dloss, dgrads = diffusion_train_step(
+        diff_state, dloss = diffusion_train_step(
             diff_state,
             vol,
             k_step,
             bool(diff_state.v_prediction),
             cond_vec_train,
         )
-        diff_state = apply_diffusion_updates(diff_state, dgrads)
 
         # energy steps (gate by flag, but e_state object always exists)
-        e_state, eloss, egrads = energy_step_E(
+        e_state, eloss = energy_step_E(
             e_state, vol, cond_vec, e_state.apply_fn, chunk=4, gp_subset=4
         )
-
-        e_state = apply_energy_updates_E(e_state, egrads)
 
         _assert_energy_state("post-E", e_state)
 
@@ -316,7 +310,7 @@ def main():
         Sb = jnp.nan_to_num(Sb, nan=0.0, posinf=0.0, neginf=0.0)  # type: ignore
         Tb = jnp.nan_to_num(Tb, nan=0.0, posinf=10000, neginf=0.0)  # type: ignore
 
-        enc_state, eloss_Enc, Enc_grads = energy_step_encoder(
+        enc_state, eloss_Enc = energy_step_encoder(
             enc_state=enc_state,
             y_emb=y_emb,
             feats_b=Fb,
@@ -328,8 +322,6 @@ def main():
             tau=float(e_state.tau),
             chunk=4,
         )
-
-        enc_state = apply_encoder_updates(enc_state, Enc_grads)
 
         eloss_E = float(eloss) + float(eloss_Enc)
 
