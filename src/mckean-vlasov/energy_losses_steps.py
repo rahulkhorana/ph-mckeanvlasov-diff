@@ -1,23 +1,22 @@
+# energy_losses_steps.py
 from __future__ import annotations
-import jax
-import optax
-import jax.numpy as jnp
-from flax import struct
-from typing import Tuple, Callable, Dict
-from dataclasses import field as dc_field
+
 from dataclasses import replace as dc_replace
+from typing import Callable, Dict, Tuple
 
-from flax.core import FrozenDict
+import jax
+import jax.numpy as jnp
 from jax import lax
+from flax import struct
+from flax.core import FrozenDict
+import optax
 
-
-# dc_field(default_factory=lambda:
 
 _F32 = jnp.float32
 _I32 = jnp.int32
 
 
-# --------------------------- State container ---------------------------
+# ===================== Energy trainer state (Flax-compatible) =====================
 
 
 @struct.dataclass
@@ -25,27 +24,27 @@ class EnergyState:
     # non-pytrees
     apply_fn: Callable = struct.field(
         pytree_node=False
-    )  # E_apply(params, L, cond) -> (B,) energy
+    )  # E_apply({"params": p}, L, cond_vec) -> (B,) energy
     tx: optax.GradientTransformation = struct.field(pytree_node=False)
 
     # pytrees
     params: FrozenDict
     opt_state: optax.OptState
 
-    # tiny EMA of per-row neg std (stabilization / telemetry)
-    scale_ema: jnp.ndarray = struct.field(pytree_node=True)  # () float32
+    # small telemetry / stabilizer
+    scale_ema: jnp.ndarray = struct.field(pytree_node=True)  # () f32
 
-    # memory queue (negatives): shape (Q, D)
-    queue: jnp.ndarray = struct.field(pytree_node=True)
-    queue_head: jnp.ndarray = struct.field(pytree_node=True)  # () int32
-    queue_count: jnp.ndarray = struct.field(pytree_node=True)  # () int32
-    queue_size: int = 4096  # python int (static)
+    # MoCo-style queue living on device (negatives as cond vectors)
+    queue: jnp.ndarray = struct.field(pytree_node=True)  # (Q, D)
+    queue_head: jnp.ndarray = struct.field(pytree_node=True)  # () i32
+    queue_count: jnp.ndarray = struct.field(pytree_node=True)  # () i32
+    queue_size: int = 1024  # python int (static)
 
-    # contrastive / scale
-    tau: float = 0.07  # temperature (python float, static)
-    gumbel_scale: float = 0.2  # scale of Gumbel noise (python float, static)
-    k_top: int = 32  # top-k negatives to focus on (python int, static)
-    label_temp: float = 1.0  # kept for API completeness (not used directly here)
+    # contrastive controls
+    tau: float = 0.07
+    gumbel_scale: float = 0.2
+    k_top: int = 32
+    label_temp: float = 1.0  # reserved for future multi-label weighting
 
     def replace(self, **updates):
         return dc_replace(self, **updates)
@@ -54,8 +53,8 @@ class EnergyState:
 def create_energy_state(
     apply_fn: Callable,
     init_params: FrozenDict,
-    D_cond: int,
     *,
+    D_cond: int,
     lr: float = 3e-4,
     weight_decay: float = 1e-4,
     tau: float = 0.07,
@@ -64,29 +63,11 @@ def create_energy_state(
     gumbel: float = 0.2,
     label_temp: float = 1.0,
 ) -> EnergyState:
-    """
-    Build a MoCo-style energy trainer state.
-
-    Args:
-        apply_fn: E_apply callable
-        init_params: flax params for the energy model
-        D_cond: dimension of cond_vec
-        lr, weight_decay: optimizer
-        tau: temperature
-        Q: queue size (should be multiple of `chunk` you’ll use at step)
-        k_top: focus on hardest negatives
-        gumbel: gumbel noise scale (0 disables)
-        label_temp: reserved for multi-label weighting (not applied here)
-
-    Returns:
-        EnergyMoCoState
-    """
-    # Small, fixed-size memory bank of negatives (lives on device, tiny)
+    """Initialize a VRAM-friendly MoCo-style energy trainer."""
     queue = jnp.zeros((int(Q), int(D_cond)), dtype=_F32)
     head0 = jnp.array(0, _I32)
     cnt0 = jnp.array(0, _I32)
 
-    # AdamW keeps weights in check
     tx = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
 
     return EnergyState(
@@ -94,19 +75,54 @@ def create_energy_state(
         tx=tx,
         params=init_params,
         opt_state=tx.init(init_params),
-        tau=float(tau),
-        gumbel_scale=float(gumbel),
-        k_top=int(k_top),
-        label_temp=float(label_temp),
+        scale_ema=jnp.array(1.0, _F32),
         queue=queue,
         queue_head=head0,
         queue_count=cnt0,
         queue_size=int(Q),
-        scale_ema=jnp.array(1.0, _F32),
+        tau=float(tau),
+        gumbel_scale=float(gumbel),
+        k_top=int(k_top),
+        label_temp=float(label_temp),
     )
 
 
-# --------------------------- Queue helpers ---------------------------
+# ===================== Small helpers (JIT-safe) =====================
+
+
+@jax.jit
+def _safe_tau(tau: float) -> jnp.ndarray:
+    return jnp.maximum(jnp.array(tau, _F32), jnp.array(1e-6, _F32))
+
+
+def _dynamic_slice_row(x: jnp.ndarray, i: jnp.ndarray) -> jnp.ndarray:
+    """Return x[i:i+1, :] with static shapes."""
+    D = x.shape[1]  # static for jit
+    return lax.dynamic_slice(x, (i, 0), (1, D))
+
+
+def _slice_Li(L: jnp.ndarray, i: jnp.ndarray) -> jnp.ndarray:
+    """L: (B,H,W,KS,C) -> Li: (H,W,KS,C)"""
+    return lax.dynamic_slice(L, (i, 0, 0, 0, 0), (1,) + L.shape[1:])[0]
+
+
+@jax.jit
+def _stop_grad(x: jnp.ndarray) -> jnp.ndarray:
+    return lax.stop_gradient(x)
+
+
+@jax.jit
+def _ema(prev: jnp.ndarray, value: jnp.ndarray, decay: float = 0.99) -> jnp.ndarray:
+    return jnp.array(decay, _F32) * prev + (1.0 - jnp.array(decay, _F32)) * value
+
+
+def _adamw_update(tx, params, opt_state, grads):
+    updates, new_opt = tx.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    return new_params, new_opt
+
+
+# ===================== Queue ops (static sizes → no dynamic shapes) =====================
 
 
 def _enqueue_queue(
@@ -116,21 +132,20 @@ def _enqueue_queue(
     new_rows: jnp.ndarray,  # (B, D)
     Q: int,  # python int
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """
-    Circular enqueue B rows into queue with wrap-around. All slice sizes static.
-    """
+    """Circular enqueue B rows into queue with wrap-around."""
     B, D = new_rows.shape
-    head = queue_head % jnp.array(Q, _I32)  # () i32
-    tail_space = jnp.array(Q, _I32) - head  # () i32
-    # First contiguous chunk size = min(B, tail_space)
+    Qi = jnp.array(Q, _I32)
+
+    head = queue_head % Qi
+    tail_space = Qi - head
     first = jnp.minimum(jnp.array(B, _I32), tail_space)
     second = jnp.array(B, _I32) - first
 
     q = queue
-    # write first [0:first] -> [head:head+first]
+    # [head:head+first]
     q = lax.dynamic_update_slice_in_dim(q, new_rows[:first, :], head, axis=0)
 
-    # write wrapped [first:B] -> [0:second] if needed
+    # wrap [0:second]
     def do_wrap(q_):
         return lax.dynamic_update_slice_in_dim(
             q_, new_rows[first:, :], jnp.array(0, _I32), axis=0
@@ -138,12 +153,31 @@ def _enqueue_queue(
 
     q = lax.cond(second > 0, do_wrap, lambda x: x, q)
 
-    new_head = (head + jnp.array(B, _I32)) % jnp.array(Q, _I32)
-    new_cnt = jnp.minimum(queue_count + jnp.array(B, _I32), jnp.array(Q, _I32))
+    new_head = (head + jnp.array(B, _I32)) % Qi
+    new_cnt = jnp.minimum(queue_count + jnp.array(B, _I32), Qi)
     return q, new_head, new_cnt
 
 
-# --------------------------- Row-wise logits over queue ---------------------------
+# ===================== Memory-safe energy forward =====================
+
+
+def _remat_energy_forward(E_apply: Callable):
+    """
+    Returns a rematerialized forward: (params, Lb, cond) -> energy
+    Does compute in bf16 to cut activation RAM, casts back to f32.
+    """
+
+    def forward(params, Lb, cond):
+        out = E_apply(
+            {"params": params}, Lb.astype(jnp.bfloat16), cond.astype(jnp.bfloat16)
+        )
+        return out.astype(_F32)
+
+    # rematerialize to avoid storing all intermediate activations
+    return jax.checkpoint(forward)  # type:ignore
+
+
+# ===================== Row-wise negatives from queue (no BxB) =====================
 
 
 def _row_neg_logits_vs_queue(
@@ -158,48 +192,48 @@ def _row_neg_logits_vs_queue(
     gumbel_scale: float,
 ) -> jnp.ndarray:
     """
-    Compute logits (negatives only) for a single Li against all valid entries in queue.
-    Uses fixed-size chunking over Q; masks entries >= valid_count.
-    Returns shape (Q,) with -inf on invalid slots.
+    Returns (Q,) logits for negatives (masked beyond valid_count).
+    Chunked over Q; **we keep chunk tiny (1–4)** to cap VRAM.
     """
     Q, D = queue.shape
-    nseg = Q // chunk  # require Q % chunk == 0 for pure static scan
     assert Q % chunk == 0, "Set queue size Q to a multiple of `chunk`."
+    nseg = Q // chunk
 
     logits0 = jnp.full((Q,), -jnp.inf, _F32)
+    tau_f = _safe_tau(tau)
+    remat_E = _remat_energy_forward(E_apply)
 
-    # Prepare Li replicated per-chunk once we know chunk size in the loop body
-    def body(carry, s):
+    def body(curr, s):
         j0 = s * chunk
         cond_seg = lax.dynamic_slice(queue, (j0, 0), (chunk, D))  # (chunk, D)
-        # mask for valid rows in this segment
         idxs = j0 + jnp.arange(chunk, dtype=_I32)  # (chunk,)
         mask_seg = idxs < valid_count  # (chunk,)
 
-        LiB = jnp.broadcast_to(Li, (chunk,) + Li.shape)  # (chunk, H,W,KS,C)
-        e_seg = E_apply({"params": params}, LiB, cond_seg).astype(_F32)  # (chunk,)
-        logits_seg = -e_seg / jnp.maximum(jnp.array(tau, _F32), 1e-6)
+        # microbatch energy: (chunk,H,W,KS,C) vs (chunk,D)
+        LiB = jnp.broadcast_to(Li, (chunk,) + Li.shape)
+        e_seg = remat_E(params, LiB, cond_seg).astype(_F32)  # (chunk,)
+        logits_seg = -e_seg / tau_f
 
-        # optional Gumbel noise (stochastic hard negatives)
+        # optional gumbel; no Python int() on tracer, pass tracer to fold_in
         if rng is not None and gumbel_scale != 0.0:
-            subkey = jax.random.fold_in(rng, int(s))
+            subkey = jax.random.fold_in(rng, s)
             u = jax.random.uniform(
                 subkey, (chunk,), minval=1e-6, maxval=1.0, dtype=_F32
             )
             g = -jnp.log(-jnp.log(u))
             logits_seg = logits_seg + jnp.array(gumbel_scale, _F32) * g
 
-        # mask out invalid queue slots
         logits_seg = jnp.where(mask_seg, logits_seg, -jnp.inf)
+        curr = lax.dynamic_update_slice_in_dim(
+            curr, logits_seg, j0, axis=0  # type:ignore
+        )
+        return curr, None
 
-        carry = lax.dynamic_update_slice_in_dim(carry, logits_seg, j0, axis=0)  # type: ignore
-        return carry, None
-
-    logits, _ = lax.scan(body, logits0, jnp.arange(nseg))
+    logits, _ = lax.scan(body, logits0, jnp.arange(nseg, dtype=_I32))
     return logits  # (Q,)
 
 
-# --------------------------- Loss per-row (no BxB) ---------------------------
+# ===================== Per-row non-saturating contrastive loss =====================
 
 
 def _row_loss(
@@ -209,6 +243,7 @@ def _row_loss(
     cond_i: jnp.ndarray,  # (1,D)
     queue: jnp.ndarray,  # (Q,D)
     valid_count: jnp.ndarray,  # () i32
+    *,
     tau: float,
     k_top: int,
     chunk: int,
@@ -216,152 +251,60 @@ def _row_loss(
     gumbel_scale: float,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Returns: (loss_i, mean_neg_e, std_neg_e)
-      loss_i = softplus(logsumexp(topk_neg - pos_logit))
+    Non-saturating top-k logistic:
+      loss_i = softplus( logsumexp( topk(neg_logits) - pos_logit ) )
+    Returns (loss_i, mean_neg_energy, std_neg_energy).
     """
-    # positive energy/logit
-    e_pos = E_apply({"params": params}, Li[None, ...], cond_i).reshape(())  # ()
-    logit_pos = -e_pos / jnp.maximum(jnp.array(tau, _F32), 1e-6)
+    tau_f = _safe_tau(tau)
+    remat_E = _remat_energy_forward(E_apply)
 
-    # negatives from queue
+    # positive (micro-batch 1)
+    e_pos = remat_E(params, Li[None, ...], cond_i).reshape(())  # ()
+    logit_pos = -e_pos / tau_f
+
+    # negatives (logits)
     neg_logits = _row_neg_logits_vs_queue(
         E_apply, params, Li, queue, valid_count, tau, chunk, rng, gumbel_scale
     )  # (Q,)
 
-    # top-k focus (largest logits are hardest negatives)
-    # Note: jnp.sort ascending → take last k
-    k = int(k_top)
-    k = max(1, min(k, neg_logits.shape[0]))
-    sorted_neg = jnp.sort(neg_logits)  # ascending
-    topk = sorted_neg[-k:]  # (k,)
+    # top-k (use lax.top_k to avoid dynamic slices)
+    k = max(1, min(int(k_top), int(neg_logits.shape[0])))
+    topk_vals, _ = lax.top_k(neg_logits, k)  # (k,)
 
-    # Non-saturating logistic: log(1 + sum_j exp(neg - pos))
-    lse = jax.nn.logsumexp(topk - logit_pos)
-    loss_i = jax.nn.softplus(lse)  # scalar
+    lse = jax.nn.logsumexp(topk_vals - logit_pos)
+    loss_i = jax.nn.softplus(lse)
 
-    # stats in energy space for EMA scale (convert back)
-    # mask invalid (-inf) before mapping back; safe convert using tau
-    valid_mask = jnp.isfinite(neg_logits)
-    neg_e = -jnp.where(valid_mask, neg_logits, -jnp.inf) * jnp.array(tau, _F32)
-    # replace -inf by pos energy to avoid contaminating stats
+    # telemetry (convert logits back to energies with tau)
+    mask = jnp.isfinite(neg_logits)
+    neg_e = -jnp.where(mask, neg_logits, -jnp.inf) * tau_f
     neg_e = jnp.where(jnp.isfinite(neg_e), neg_e, e_pos)
-    mean_e = jnp.mean(neg_e)  # type: ignore
-    std_e = jnp.std(neg_e)  # type: ignore
-
+    mean_e = jnp.mean(neg_e)
+    std_e = jnp.sqrt(jnp.maximum(jnp.var(neg_e), jnp.array(1e-12, _F32)))
     return loss_i, mean_e, std_e
 
 
-# --------------------------- Public step (JIT) ---------------------------
-
-
-@jax.jit
-def _ceiling_div(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
-    return (a + b - 1) // b
-
-
-@jax.jit
-def _safe_mean(x: jnp.ndarray) -> jnp.ndarray:
-    return jnp.mean(x.astype(_F32))
-
-
-@jax.jit
-def _safe_std(x: jnp.ndarray) -> jnp.ndarray:
-    x = x.astype(_F32)
-    return jnp.sqrt(jnp.maximum(jnp.var(x), jnp.array(1e-12, _F32)))
-
-
-@jax.jit
-def _adamw_update(
-    tx: optax.GradientTransformation,
-    params: FrozenDict,
-    opt_state: optax.OptState,
-    grads,
-):
-    updates, new_opt = tx.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
-    return new_params, new_opt
-
-
-@jax.jit
-def _ema_update(
-    prev: jnp.ndarray, value: jnp.ndarray, decay: float = 0.99
-) -> jnp.ndarray:
-    return jnp.array(decay, _F32) * prev + (1.0 - jnp.array(decay, _F32)) * value
-
-
-@jax.jit
-def _stop_grad(x: jnp.ndarray) -> jnp.ndarray:
-    return lax.stop_gradient(x)
-
-
-@jax.jit
-def _concat(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
-    return jnp.concatenate([a, b], axis=0)
-
-
-@jax.jit
-def _dynamic_slice_row(x: jnp.ndarray, i: jnp.ndarray, D: int) -> jnp.ndarray:
-    return lax.dynamic_slice(x, (i, 0), (1, D))
-
-
-@jax.jit
-def _broadcast_L(Li: jnp.ndarray, n: int) -> jnp.ndarray:
-    return jnp.broadcast_to(Li, (n,) + Li.shape)
-
-
-@jax.jit
-def _int32(x: int) -> jnp.ndarray:
-    return jnp.array(x, _I32)
-
-
-@jax.jit
-def _zero_like_scalar(x: jnp.ndarray) -> jnp.ndarray:
-    return jnp.zeros_like(x, dtype=_F32)
-
-
-@jax.jit
-def _one_like_scalar(x: jnp.ndarray) -> jnp.ndarray:
-    return jnp.ones_like(x, dtype=_F32)
-
-
-@jax.jit
-def _sum(x: jnp.ndarray) -> jnp.ndarray:
-    return jnp.sum(x)
-
-
-@jax.jit
-def _stack(xs):
-    return jnp.stack(xs, axis=0)
+# ===================== Batch loss (scan over rows) =====================
 
 
 def _batch_energy_loss(
     state: EnergyState,
     params: FrozenDict,
-    L: jnp.ndarray,  # (B, H,W,KS,C)
-    cond_vec: jnp.ndarray,  # (B, D)
+    L: jnp.ndarray,  # (B,H,W,KS,C)
+    cond_vec: jnp.ndarray,  # (B,D)
     rng: jnp.ndarray,
     *,
     chunk: int,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Pure loss for current batch (no in-batch negatives, only queue).
-    Returns:
-      loss (scalar),
-      metrics dict,
-      new_queue, new_head, new_count (for enqueue later)
+    Returns: loss, metrics, new_queue, new_head, new_count
     """
-    B, D = cond_vec.shape
-    Q, Dq = state.queue.shape
-    assert D == Dq, "cond_vec dim must equal queue dim."
+    B = L.shape[0]
 
-    # Per-row loss in a scan (static shapes).
     def row_body(carry, i):
-        # deterministic row RNG
         row_rng = jax.random.fold_in(rng, i)
-
-        Li = lax.dynamic_slice(L, (i, 0, 0, 0, 0), (1,) + L.shape[1:])
-        Li = Li[0]  # (H,W,KS,C)
-        cond_i = _dynamic_slice_row(cond_vec, jnp.array(i, _I32), D)  # (1, D)
+        Li = _slice_Li(L, jnp.array(i, _I32))  # (H,W,KS,C)
+        cond_i = _dynamic_slice_row(cond_vec, jnp.array(i, _I32))  # (1,D)
 
         li, mean_e, std_e = _row_loss(
             state.apply_fn,
@@ -370,11 +313,11 @@ def _batch_energy_loss(
             cond_i,
             state.queue,
             state.queue_count,
-            state.tau,
-            state.k_top,
-            chunk,
-            row_rng,
-            state.gumbel_scale,
+            tau=state.tau,
+            k_top=state.k_top,
+            chunk=chunk,
+            rng=row_rng,
+            gumbel_scale=state.gumbel_scale,
         )
         carry = (
             carry[0] + li,
@@ -388,12 +331,11 @@ def _batch_energy_loss(
         (jnp.array(0.0, _F32), jnp.array(0.0, _F32), jnp.array(0.0, _F32)),
         jnp.arange(B, dtype=_I32),
     )
-
     loss = sum_loss / jnp.array(B, _F32)
     mean_e = sum_mean_e / jnp.array(B, _F32)
     std_e = sum_std_e / jnp.array(B, _F32)
 
-    # enqueue stop-grad version of conds
+    # enqueue current conds (stop-grad)
     cond_sg = _stop_grad(cond_vec.astype(_F32))
     new_q, new_head, new_cnt = _enqueue_queue(
         state.queue, state.queue_head, state.queue_count, cond_sg, state.queue_size
@@ -407,64 +349,9 @@ def _batch_energy_loss(
     return loss, metrics, new_q, new_head, new_cnt
 
 
-@jax.jit
-def _update_scale(prev_scale: jnp.ndarray, batch_std: jnp.ndarray) -> jnp.ndarray:
-    return _ema_update(prev_scale, batch_std, decay=0.99)
+# ===================== Loss+grads wrapper (correct aux ordering) =====================
 
 
-@jax.jit
-def _apply_grads(
-    tx: optax.GradientTransformation,
-    params: FrozenDict,
-    opt_state: optax.OptState,
-    grads,
-):
-    return _adamw_update(tx, params, opt_state, grads)
-
-
-@jax.jit
-def _replace_state_core(
-    state: EnergyState,
-    params: FrozenDict,
-    opt_state: optax.OptState,
-    queue: jnp.ndarray,
-    head: jnp.ndarray,
-    count: jnp.ndarray,
-    scale_ema: jnp.ndarray,
-) -> EnergyState:
-    # flax.struct dataclasses are immutable: use .replace
-    return state.replace(
-        params=params,
-        opt_state=opt_state,
-        queue=queue,
-        queue_head=head,
-        queue_count=count,
-        scale_ema=scale_ema,
-    )
-
-
-@jax.jit
-def _pack_aux(loss: jnp.ndarray, metrics: Dict[str, jnp.ndarray]):
-    # pack metrics as a tuple of scalars to keep jit+pytree simple
-    return (
-        loss,
-        metrics["energy/mean_e"],
-        metrics["energy/std_e"],
-        metrics["energy/queue_count"],
-    )
-
-
-@jax.jit
-def _unpack_aux(aux):
-    loss, mean_e, std_e, qcnt = aux
-    return loss, {
-        "energy/mean_e": mean_e,
-        "energy/std_e": std_e,
-        "energy/queue_count": qcnt,
-    }
-
-
-@jax.jit
 def _loss_and_grads(
     state: EnergyState,
     params: FrozenDict,
@@ -473,16 +360,30 @@ def _loss_and_grads(
     rng: jnp.ndarray,
     chunk: int,
 ):
+    """
+    Return ((loss, aux), grads) with aux=(metrics, new_q, new_head, new_cnt).
+    """
+
     def loss_fn(p):
         loss, metrics, new_q, new_head, new_cnt = _batch_energy_loss(
             state, p, L, cond_vec, rng, chunk=chunk
         )
-        return _pack_aux(loss, metrics), (new_q, new_head, new_cnt)
+        aux = (metrics, new_q, new_head, new_cnt)
+        return loss, aux
 
-    (aux, (new_q, new_head, new_cnt)), grads = jax.value_and_grad(
-        loss_fn, has_aux=True
-    )(params)
-    return aux, grads, new_q, new_head, new_cnt
+    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    return loss, aux, grads
+
+
+# ===================== Public training step =====================
+
+
+def _choose_safe_chunk(Q: int, requested: int) -> int:
+    """Pick the largest divisor of Q not exceeding requested; at least 1."""
+    c = max(1, min(int(requested), int(Q)))
+    while Q % c != 0 and c > 1:
+        c //= 2
+    return max(1, c)
 
 
 def energy_step_E_bank(
@@ -491,39 +392,38 @@ def energy_step_E_bank(
     cond_vec: jnp.ndarray,  # (B,D)
     rng: jnp.ndarray,  # PRNGKey
     *,
-    chunk: int = 64,  # must divide queue_size
+    chunk: int = 2,  # **tiny** micro-batch for queue scoring
+    k_top_override: int | None = None,
 ) -> Tuple[EnergyState, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
-    One MoCo contrastive step for the energy model.
-
-    Notes:
-      - No in-batch negatives (only queue) → stable VRAM.
-      - Queue size Q **must be a multiple of `chunk`**.
-      - All slice sizes are static; no dynamic index sizes.
-
-    Returns:
-      new_state, loss (scalar), metrics dict
+    One VRAM-friendly contrastive step for the energy model using a device-side queue.
     """
-    # Compute loss & grads (and the updated queue content)
-    aux, grads, new_q, new_head, new_cnt = _loss_and_grads(
-        state, state.params, L, cond_vec, rng, jnp.array(chunk, _I32)
+    # optional runtime k_top override
+    if k_top_override is not None and k_top_override != state.k_top:
+        state = state.replace(k_top=int(k_top_override))
+
+    # auto-shrink chunk to a safe divisor of Q to prevent unrolling bloat
+    chunk_eff = _choose_safe_chunk(state.queue_size, chunk)
+
+    # compute loss+grads
+    loss, aux, grads = _loss_and_grads(
+        state, state.params, L, cond_vec, rng, chunk=chunk_eff
     )
-    loss, metrics = _unpack_aux(aux)
+    metrics, new_q, new_head, new_cnt = aux
 
-    # Optimizer update
-    new_params, new_opt = _apply_grads(state.tx, state.params, state.opt_state, grads)
+    # optimizer update
+    new_params, new_opt = _adamw_update(state.tx, state.params, state.opt_state, grads)
 
-    # EMA scale update
-    new_scale = _update_scale(state.scale_ema, metrics["energy/std_e"])
+    # EMA scale telemetry
+    new_scale = _ema(state.scale_ema, metrics["energy/std_e"], 0.99)
 
-    # Pack new state
-    new_state = _replace_state_core(
-        state,
+    # pack state
+    new_state = state.replace(
         params=new_params,
         opt_state=new_opt,
         queue=new_q,
-        head=new_head,
-        count=new_cnt,
+        queue_head=new_head,
+        queue_count=new_cnt,
         scale_ema=new_scale,
     )
     return new_state, loss, metrics

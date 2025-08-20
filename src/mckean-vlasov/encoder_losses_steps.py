@@ -11,7 +11,6 @@ from flax import struct
 from flax.core import FrozenDict
 import optax
 
-
 _F32 = jnp.float32
 _I32 = jnp.int32
 
@@ -45,10 +44,7 @@ def create_encoder_state(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
 ) -> EncoderState:
-    """
-    Build encoder optimizer state. The encoder is trained with a contrastive objective
-    scored by the (frozen) energy model against a memory queue of cond vectors.
-    """
+    """Build encoder optimizer state."""
     tx = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
     return EncoderState(
         apply_fn=apply_fn,
@@ -72,17 +68,11 @@ def _ema(prev: jnp.ndarray, value: jnp.ndarray, decay: float = 0.99) -> jnp.ndar
     return decay * prev + (1.0 - decay) * value
 
 
-@jax.jit
+# DO NOT jit this (tx is a Python object)
 def _adamw_update(tx, params, opt_state, grads):
     updates, new_opt = tx.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
     return new_params, new_opt
-
-
-@jax.jit
-def _dynamic_slice_row(x: jnp.ndarray, i: jnp.ndarray, D: int) -> jnp.ndarray:
-    # returns (1, D)
-    return lax.dynamic_slice(x, (i, 0), (1, D))
 
 
 @jax.jit
@@ -93,8 +83,17 @@ def _slice_Li(L: jnp.ndarray, i: jnp.ndarray) -> jnp.ndarray:
 
 
 @jax.jit
+def _dynamic_slice_row(x: jnp.ndarray, i: jnp.ndarray) -> jnp.ndarray:
+    """
+    Return x[i:i+1, :] using dynamic start index and static slice size.
+    Avoids tracer->python int conversion entirely.
+    """
+    return lax.dynamic_slice_in_dim(x, start_index=i, slice_size=1, axis=0)
+
+
+@jax.jit
 def _safe_tau(tau: float) -> jnp.ndarray:
-    return jnp.maximum(jnp.array(tau, _F32), 1e-6)
+    return jnp.maximum(jnp.array(tau, _F32), jnp.array(1e-6, _F32))
 
 
 @jax.jit
@@ -138,7 +137,7 @@ def _row_neg_logits_vs_queue(
 
         # optional gumbel noise
         if rng is not None and gumbel_scale != 0.0:
-            subkey = jax.random.fold_in(rng, int(s))
+            subkey = jax.random.fold_in(rng, s)  # tracer-safe
             u = jax.random.uniform(
                 subkey, (chunk,), minval=1e-6, maxval=1.0, dtype=_F32
             )
@@ -149,7 +148,7 @@ def _row_neg_logits_vs_queue(
         curr = lax.dynamic_update_slice_in_dim(curr, logits_seg, j0, axis=0)  # type: ignore
         return curr, None
 
-    logits, _ = lax.scan(body, logits0, jnp.arange(nseg))
+    logits, _ = lax.scan(body, logits0, jnp.arange(nseg, dtype=_I32))
     return logits  # (Q,)
 
 
@@ -186,7 +185,6 @@ def _row_loss(
 
     # top-k selection (largest logits are hardest negatives)
     k = max(1, min(int(k_top), neg_logits.shape[0]))
-    # prefer lax.top_k to avoid full sort O(Q log Q)
     topk_vals, _ = lax.top_k(neg_logits, k)  # (k,)
     lse = jax.nn.logsumexp(topk_vals - logit_pos)  # scalar
     loss_i = jax.nn.softplus(lse)
@@ -237,6 +235,7 @@ def energy_step_encoder(
     """
     B = L.shape[0]
     Q, D = queue.shape
+    assert Q % chunk == 0, "queue size Q must be a multiple of `chunk`."
 
     # Build current cond vectors from encoder
     m_emb = enc_state.apply_fn(
@@ -248,7 +247,7 @@ def energy_step_encoder(
     def row_body(carry, i):
         row_rng = jax.random.fold_in(rng, i)
         Li = _slice_Li(L, jnp.array(i, _I32))  # (H,W,KS,C)
-        cond_i = _dynamic_slice_row(cond_vec, jnp.array(i, _I32), D)  # (1, D)
+        cond_i = _dynamic_slice_row(cond_vec, jnp.array(i, _I32))  # (1, D)
 
         li, mean_e, std_e = _row_loss(
             E_apply,
@@ -287,10 +286,10 @@ def energy_step_encoder(
             _F32
         )  # (B,D)
 
-        def row_body2(carry, i):
+        def row_body2(acc, i):
             row_rng = jax.random.fold_in(rng, i)
             Li = _slice_Li(L, jnp.array(i, _I32))
-            cond_i = _dynamic_slice_row(cond_local, jnp.array(i, _I32), D)
+            cond_i = _dynamic_slice_row(cond_local, jnp.array(i, _I32))
             li, _, _ = _row_loss(
                 E_apply,
                 eparams,
@@ -304,7 +303,7 @@ def energy_step_encoder(
                 rng=row_rng,
                 gumbel_scale=gumbel_scale,
             )
-            return carry + li, None
+            return acc + li, None
 
         sum_l, _ = lax.scan(row_body2, jnp.array(0.0, _F32), jnp.arange(B, dtype=_I32))
         return sum_l / jnp.array(B, _F32)
