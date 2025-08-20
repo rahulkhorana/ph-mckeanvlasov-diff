@@ -291,7 +291,16 @@ def main():
 
         # energy steps (gate by flag, but e_state object always exists)
         e_state, eloss = energy_step_E(
-            e_state, vol, cond_vec, e_state.apply_fn, chunk=4, gp_subset=4
+            e_state=e_state,
+            L=vol,
+            cond_vec=cond_vec,
+            E_apply=e_state.apply_fn,
+            chunk=4,
+            gp_subset=2,
+            hinge_topk=3,
+            margin=0.2,
+            hinge_weight=0.5,
+            gumbel_scale=0.03,
         )
 
         _assert_energy_state("post-E", e_state)
