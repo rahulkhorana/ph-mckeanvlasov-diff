@@ -591,3 +591,89 @@ def energy_step_encoder(
     new_params = optax.apply_updates(enc_state.params, updates)
     new_state = enc_state.replace(params=new_params, opt_state=new_opt)
     return new_state, loss
+
+
+###########################################################################################
+def _first(x):
+    # unwrap (energy, aux) -> energy
+    return x[0] if isinstance(x, (tuple, list)) else x
+
+
+def _row_stream_loss(E_apply, params, Li, pos, neg_bank, neg_mask, tau, chunk, k_top):
+    K, D = neg_bank.shape
+    Li1 = Li[None, ...]  # (1, ...)
+    pos1 = pos[None, ...]  # (1, D)
+
+    # --- positive logit ---
+    e_pos = _first(E_apply({"params": params}, Li1, pos1))  # () or (1,)
+    e_pos = jnp.asarray(e_pos, _F32).reshape(())  # scalar
+    logit_pos = -e_pos / jnp.maximum(tau, 1e-6)
+
+    # --- stream negatives in fixed-size chunks ---
+    nseg = (K + chunk - 1) // chunk
+    K_pad = nseg * chunk
+    pad_n = K_pad - K
+
+    bank_pad = jnp.pad(neg_bank, ((0, pad_n), (0, 0)))
+    mask_pad = jnp.pad(neg_mask, ((0, pad_n),), constant_values=False)
+
+    # scalar accumulator for logsumexp(neg_logits - pos_logit)
+    lse = jnp.array(-jnp.inf, _F32)
+    topk = jnp.full((k_top,), -jnp.inf, _F32)
+
+    def body(carry, s):
+        lse, topk = carry
+        j0 = s * chunk
+        seg = lax.dynamic_slice(bank_pad, (j0, 0), (chunk, D))  # (chunk, D)
+        msk = lax.dynamic_slice(mask_pad, (j0,), (chunk,))  # (chunk,)
+        LiB = jnp.broadcast_to(Li1, (chunk,) + Li1.shape[1:])  # (chunk, ...)
+
+        e_seg = _first(E_apply({"params": params}, LiB, seg))  # (chunk,)
+        e_seg = jnp.asarray(e_seg, _F32).reshape((chunk,))
+
+        # mask: invalid -> +inf energy -> -inf logit
+        e_seg = jnp.where(msk, e_seg, jnp.array(jnp.inf, _F32))
+        logits = -e_seg / jnp.maximum(tau, 1e-6)  # (chunk,)
+
+        # --- correct scalar LSE update ---
+        vals = jnp.where(msk, logits - logit_pos, -jnp.inf)  # (chunk,)
+        seglse = jax.nn.logsumexp(vals)  # scalar
+        lse = jnp.logaddexp(lse, seglse)
+
+        # --- top-k hardest negatives (by logit) ---
+        seg_topk = jnp.sort(jnp.where(msk, logits, -jnp.inf))[-k_top:]
+        topk = jnp.sort(jnp.concatenate([topk, seg_topk], 0))[-k_top:]
+        return (lse, topk), None
+
+    (lse, topk), _ = lax.scan(body, (lse, topk), jnp.arange(nseg))
+
+    # CE(pos vs all negs) + non-saturating top-k term
+    ce = lse
+    k_loss = jnp.mean(jnp.log1p(jnp.exp(topk - logit_pos)))  # softplus
+    return ce + 0.25 * k_loss
+
+
+@partial(jax.jit, static_argnames=("E_apply", "chunk", "k_top"))
+def energy_step_E_bank(
+    e_state, L, cond_vec, E_apply, neg_bank, neg_mask, chunk=4, k_top=8
+):
+    tau = jnp.asarray(e_state.tau, _F32)
+
+    def loss_fn(p):
+        B = L.shape[0]
+
+        def row(carry, i):
+            Li = L[i]
+            pos = cond_vec[i]
+            li = _row_stream_loss(
+                E_apply, p, Li, pos, neg_bank, neg_mask, tau, chunk, k_top
+            )
+            return carry + li, None
+
+        loss, _ = lax.scan(row, jnp.array(0.0, _F32), jnp.arange(B))
+        return loss / B
+
+    loss, grads = jax.value_and_grad(loss_fn)(e_state.params)
+    updates, new_opt = e_state.tx.update(grads, e_state.opt_state, e_state.params)
+    new_params = optax.apply_updates(e_state.params, updates)
+    return e_state.replace(params=new_params, opt_state=new_opt), loss

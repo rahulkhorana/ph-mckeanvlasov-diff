@@ -27,10 +27,11 @@ from losses_steps import (
     create_energy_state,
     create_encoder_state,
     diffusion_train_step,
-    energy_step_E,
+    energy_step_E_bank,
     energy_step_encoder,
 )
 from sampling import mv_sde_sample, make_energy_guidance
+from mem_bank import init_cpu_bank, bank_enqueue, bank_sample, K_BANK, Q_BANK
 
 
 # -------------------------- utils --------------------------
@@ -240,6 +241,8 @@ def main():
 
     # Energy net (ALWAYS create; gate use by args.use_energy)
     E = EnergyNetwork(ch=48, cond_dim=y_dim + 256)
+    cpu_bank = init_cpu_bank(Q_BANK, y_dim + 256)
+
     E_params = E.init(k_energy, x_d, cond0)["params"]
     e_state = create_energy_state(
         E.apply,
@@ -289,19 +292,22 @@ def main():
             cond_vec_train,
         )
 
+        negs_np, mask_np = bank_sample(cpu_bank, K_BANK)  # host
+        neg_bank = jax.device_put(negs_np)  # tiny device copy
+        neg_mask = jax.device_put(mask_np)
+
         # energy steps (gate by flag, but e_state object always exists)
-        e_state, eloss = energy_step_E(
-            e_state=e_state,
-            L=vol,
-            cond_vec=cond_vec,
-            E_apply=e_state.apply_fn,
+        e_state, eloss = energy_step_E_bank(
+            e_state,
+            vol,
+            cond_vec,
+            e_state.apply_fn,
+            neg_bank=neg_bank,
+            neg_mask=neg_mask,
             chunk=4,
-            gp_subset=2,
-            hinge_topk=3,
-            margin=0.2,
-            hinge_weight=0.5,
-            gumbel_scale=0.03,
+            k_top=8,
         )
+        bank_enqueue(cpu_bank, np.asarray(jax.device_get(cond_vec), dtype=np.float32))
 
         _assert_energy_state("post-E", e_state)
 
