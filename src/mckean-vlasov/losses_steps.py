@@ -1,8 +1,8 @@
 # losses_steps.py
 from __future__ import annotations
 
-from dataclasses import replace as dc_replace
 from functools import partial
+from dataclasses import replace as dc_replace
 from typing import Callable, Tuple, Union
 
 import jax
@@ -14,37 +14,33 @@ from flax import struct
 from flax.core import FrozenDict
 
 FloatScalar = Union[float, jnp.ndarray]
+_F32 = jnp.float32
+_EPS = 1e-6
 
 # ===================== Noise schedules =====================
 
 
 def cosine_beta_schedule(T: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     s = 0.008
-    t = jnp.linspace(0, 1, T + 1, dtype=jnp.float32)
+    t = jnp.linspace(0, 1, T + 1, dtype=_F32)
     f = jnp.cos(((t + s) / (1 + s)) * jnp.pi * 0.5) ** 2
     f = f / f[0]
     alpha_bars = f[1:]
-    alphas = alpha_bars / jnp.concatenate(
-        [jnp.array([1.0], jnp.float32), alpha_bars[:-1]]
-    )
+    alphas = alpha_bars / jnp.concatenate([jnp.array([1.0], _F32), alpha_bars[:-1]])
     betas = 1.0 - alphas
-    return (
-        betas.astype(jnp.float32),
-        alphas.astype(jnp.float32),
-        alpha_bars.astype(jnp.float32),
-    )
+    return betas.astype(_F32), alphas.astype(_F32), alpha_bars.astype(_F32)
 
 
 def linear_beta_schedule(
     T: int, start=1e-4, end=2e-2
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    betas = jnp.linspace(start, end, T, dtype=jnp.float32)
+    betas = jnp.linspace(start, end, T, dtype=_F32)
     alphas = 1.0 - betas
     alpha_bars = jnp.cumprod(alphas, axis=0)
     return betas, alphas, alpha_bars
 
 
-# ===================== State containers =====================
+# ===================== States =====================
 
 
 @struct.dataclass
@@ -73,7 +69,7 @@ class EnergyState:
 
     params: FrozenDict
     opt_state: optax.OptState
-    tau: float = 0.07
+    tau: float = 0.10
     gp_lambda: float = 1e-4
 
     def replace(self, **updates):
@@ -84,7 +80,6 @@ class EnergyState:
 class EncoderState:
     apply_fn: Callable = struct.field(pytree_node=False)
     tx: optax.GradientTransformation = struct.field(pytree_node=False)
-
     params: FrozenDict
     opt_state: optax.OptState
 
@@ -92,7 +87,7 @@ class EncoderState:
         return dc_replace(self, **updates)
 
 
-# ===================== State builders =====================
+# ===================== Builders =====================
 
 
 def create_diffusion_state(
@@ -108,7 +103,10 @@ def create_diffusion_state(
     betas, alphas, alpha_bars = (
         cosine_beta_schedule(T) if schedule == "cosine" else linear_beta_schedule(T)
     )
-    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(lr),
+    )
     return DiffusionState(
         apply_fn=apply_fn,
         tx=tx,
@@ -127,11 +125,14 @@ def create_diffusion_state(
 def create_energy_state(
     apply_fn: Callable,
     init_params: FrozenDict,
-    lr: float = 1e-3,
-    tau: float = 0.07,
+    lr: float = 3e-4,
+    tau: float = 0.10,
     gp_lambda: float = 1e-4,
 ) -> EnergyState:
-    tx = optax.adam(lr)
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(lr),
+    )
     return EnergyState(
         apply_fn=apply_fn,
         tx=tx,
@@ -145,7 +146,10 @@ def create_energy_state(
 def create_encoder_state(
     apply_fn: Callable, init_params: FrozenDict, lr: float = 1e-3
 ) -> EncoderState:
-    tx = optax.adam(lr)
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(lr),
+    )
     return EncoderState(
         apply_fn=apply_fn,
         tx=tx,
@@ -154,273 +158,321 @@ def create_encoder_state(
     )
 
 
-# ===================== Helpers for diffusion =====================
+# ===================== Diffusion: Min-SNR v-objective =====================
 
 
 def _sinusoidal_time_embed(t_cont: jnp.ndarray, dim: int = 128) -> jnp.ndarray:
     half = dim // 2
-    freqs = jnp.exp(
-        jnp.linspace(jnp.log(1.0), jnp.log(10_000.0), half, dtype=jnp.float32)
-    )
+    freqs = jnp.exp(jnp.linspace(jnp.log(1.0), jnp.log(10_000.0), half, dtype=_F32))
     angles = t_cont[:, None] * (1.0 / freqs[None, :])
-    emb = jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
-    return jax.nn.relu(emb)
+    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
 
 
 def _charbonnier(x: jnp.ndarray, eps: float = 1e-6, alpha: float = 0.5) -> jnp.ndarray:
     return jnp.power(x * x + eps, alpha)
 
 
-def _reconstruct_x0_eps_from_v(
-    xt: jnp.ndarray, v: jnp.ndarray, alpha_bar_t: jnp.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    sa = jnp.sqrt(alpha_bar_t)[..., None, None, None, None]
-    sb = jnp.sqrt(1.0 - alpha_bar_t)[..., None, None, None, None]
+def _reconstruct_x0_eps_from_v(xt: jnp.ndarray, v: jnp.ndarray, a_bar: jnp.ndarray):
+    sa = jnp.sqrt(a_bar)[..., None, None, None, None]
+    sb = jnp.sqrt(1.0 - a_bar)[..., None, None, None, None]
     x0_hat = sa * xt - sb * v
     eps_hat = sb * xt + sa * v
     return x0_hat, eps_hat
 
 
-# ===================== Diffusion loss & step =====================
+def _minsnr_weight(a_bar: jnp.ndarray, gamma: float = 5.0) -> jnp.ndarray:
+    snr = a_bar / jnp.clip(1.0 - a_bar, 1e-8, None)
+    w = jnp.minimum(snr, jnp.asarray(gamma, _F32)) / (snr + 1.0)
+    return w
 
 
 def _ddpm_loss(
     unet_apply: Callable,
     params: FrozenDict,
     rng,
-    x0: jnp.ndarray,  # (B,H,W,KS,C) standardized
-    alpha_bars: jnp.ndarray,  # (T,)
-    alphas: jnp.ndarray,  # (T,)
+    x0: jnp.ndarray,
+    alpha_bars: jnp.ndarray,
     v_prediction: bool,
-    cond_vec: jnp.ndarray,  # (B, D)
-    t_dim: int = 128,
-    lambda_x0: float = 0.1,
-    x0_weight_pow: float = 1.5,
+    cond_vec: jnp.ndarray,
 ) -> jnp.ndarray:
+    x0 = x0.astype(_F32)
+    cond_vec = cond_vec.astype(_F32)
     B = x0.shape[0]
     key_t, key_eps = jax.random.split(rng)
-
-    t_int = jax.random.randint(
-        key_t, shape=(B,), minval=0, maxval=alpha_bars.shape[0], dtype=jnp.int32
-    )
-    a_bar = alpha_bars[t_int].astype(jnp.float32)
-
-    eps = jax.random.normal(key_eps, x0.shape, dtype=jnp.float32)
+    T = int(alpha_bars.shape[0])
+    t_int = jax.random.randint(key_t, (B,), 0, T, dtype=jnp.int32)
+    a_bar = alpha_bars[t_int].astype(_F32)
+    eps = jax.random.normal(key_eps, x0.shape, dtype=_F32)
     sa = jnp.sqrt(a_bar)[..., None, None, None, None]
     sb = jnp.sqrt(1.0 - a_bar)[..., None, None, None, None]
     xt = sa * x0 + sb * eps
-
-    t_cont = (t_int.astype(jnp.float32) + 0.5) / float(alpha_bars.shape[0])
-    temb = _sinusoidal_time_embed(t_cont, dim=t_dim)
-
-    pred = unet_apply({"params": params}, xt, temb, cond_vec)  # predict v or eps
-
-    if v_prediction:
-        target = sa * eps - sb * x0
-    else:
-        target = eps
-
-    main_loss = jnp.mean(_charbonnier(pred - target))
-
+    t_cont = (t_int.astype(_F32) + 0.5) / float(T)
+    temb = _sinusoidal_time_embed(t_cont, dim=128)
+    pred = unet_apply({"params": params}, xt, temb, cond_vec).astype(_F32)
+    target = sa * eps - sb * x0 if v_prediction else eps
+    resid = pred - target
+    per = _charbonnier(resid).reshape(B, -1).mean(-1)
+    w = _minsnr_weight(a_bar, gamma=5.0)
+    main_loss = (w * per).mean()
     x0_hat, _ = _reconstruct_x0_eps_from_v(xt, pred, a_bar)
-    w_x0 = jnp.power(1.0 - a_bar, x0_weight_pow)[..., None, None, None, None]
-    aux_loss = jnp.mean(w_x0 * _charbonnier(x0_hat - x0))
-
-    return main_loss + lambda_x0 * aux_loss
+    x0_resid = x0_hat - x0
+    w_x0 = jnp.power(1.0 - a_bar, 1.25)
+    aux_loss = (w_x0 * _charbonnier(x0_resid).reshape(B, -1).mean(-1)).mean()
+    total_loss = main_loss + 0.1 * aux_loss
+    # MODIFIED: Convert any NaN/inf loss to 0.0 to prevent gradient poisoning.
+    return jnp.nan_to_num(total_loss, nan=-1)
 
 
 @partial(jax.jit, static_argnames=("v_prediction",))
 def diffusion_train_step(
     state: DiffusionState,
-    x0: jnp.ndarray,  # (B,H,W,KS,C) standardized
-    rng,  # PRNGKey
-    v_prediction: bool,  # bool
-    cond_vec: jnp.ndarray,  # (B,D)
+    x0: jnp.ndarray,
+    rng,
+    v_prediction: bool,
+    cond_vec: jnp.ndarray,
 ):
-    def loss_fn(p):
-        return _ddpm_loss(
-            state.apply_fn,
-            p,
-            rng,
-            x0,
-            state.alpha_bars,
-            state.alphas,
-            v_prediction,
-            cond_vec,
-            t_dim=128,
-            lambda_x0=0.1,
-            x0_weight_pow=1.5,
-        )
-
+    loss_fn = lambda p: _ddpm_loss(
+        state.apply_fn, p, rng, x0, state.alpha_bars, v_prediction, cond_vec
+    )
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    return state, loss, grads
+
+
+def apply_diffusion_updates(state: DiffusionState, grads):
     updates, new_opt = state.tx.update(grads, state.opt_state, state.params)
     new_params = optax.apply_updates(state.params, updates)
-
     new_ema = tree_map(
         lambda e, q: state.ema_decay * e + (1.0 - state.ema_decay) * q,
         state.ema_params,
         new_params,
     )
-
-    new_state = state.replace(params=new_params, opt_state=new_opt, ema_params=new_ema)
-    return new_state, loss
+    return state.replace(params=new_params, opt_state=new_opt, ema_params=new_ema)
 
 
-# ======================= ENERGY: subsampled, JAX-friendly =======================
+# ======================= ENERGY: Debiased InfoNCE + Ranking =======================
 
 
-def _row_loss_subsampled(
-    E_apply, params, Li, cond_vec, tau: FloatScalar, margin: float, neg_k: int, i: int
-):
-    """
-    Fixed-size ring sampling: J = neg_k+1 (static). We mask invalid negatives when B < J.
-    Positive is at rel=0 (self), negatives are i+1..i+neg_k (mod B).
-    """
-    B = cond_vec.shape[0]  # Python int (static w.r.t. jit)
-    J = int(neg_k) + 1  # static
-    rel = jnp.arange(J, dtype=jnp.int32)  # (J,)
-    idx = (i + rel) % max(B, 1)  # (J,)
-    cond_sub = cond_vec[idx]  # (J,D)
-    LiJ = jnp.broadcast_to(Li, (J,) + Li.shape)  # (J,H,W,KS,C)
-
-    tau = jnp.asarray(tau, jnp.float32)
-    e = E_apply({"params": params}, LiJ, cond_sub)  # (J,)
-    logits = -e / jnp.maximum(tau, 1e-6)  # (J,)
-
-    # mask: keep positive (rel=0) always; valid negatives only when rel < B
-    valid = jnp.concatenate([jnp.array([True]), (rel[1:] < B)])  # shape (J,)
-    logits = jnp.where(valid, logits, -jnp.inf)
-
-    # CE with label 0 (positive)
-    logits_b = jnp.expand_dims(logits, 0)  # type: ignore
-    ce = optax.softmax_cross_entropy_with_integer_labels(
-        logits_b, jnp.array([i], jnp.int32)
-    ).squeeze()
-
-    # hinge on energies for valid negatives
-    E_row = -tau * logits
-    pos = E_row[0]
-    diff = E_row - pos
-    neg_mask = jnp.concatenate(
-        [jnp.array([0.0], jnp.float32), (rel[1:] < B).astype(jnp.float32)]
-    )
-    hinge = jnp.maximum(0.0, margin - diff) * neg_mask
-    denom = jnp.maximum(jnp.sum(neg_mask), 1.0)
-    hinge = jnp.sum(hinge) / denom
-    return ce, hinge
-
-
-def energy_total_loss_subsampled(
+def _row_pass_debiased(
     E_apply,
     params,
-    L,  # (B,H,W,KS,C)
-    cond_vec,  # (B,D)
+    Li,
+    cond_vec,
+    i_idx: int,
     tau: FloatScalar,
-    gp_lambda: FloatScalar = 0.0,
-    margin: float = 0.1,
-    hinge_weight: float = 0.25,
-    neg_k: int = 7,  # fixed #negatives per row
-    gp_subset: int = 4,  # GP on first gp_subset rows
-) -> jnp.ndarray:
-    B = L.shape[0]  # Python int
-    tau = jnp.asarray(tau, jnp.float32)
-    gp_lambda = jnp.asarray(gp_lambda, jnp.float32)
-
-    def scan_body(carry, i):
-        Li = L[i]
-        ce_i, hinge_i = _row_loss_subsampled(
-            E_apply, params, Li, cond_vec, tau, margin, neg_k, i
-        )
-        return (carry[0] + ce_i, carry[1] + hinge_i), None
-
-    (ce_sum, hinge_sum), _ = lax.scan(scan_body, (0.0, 0.0), jnp.arange(B))
-    ce = ce_sum / jnp.maximum(B, 1)
-    hinge = hinge_sum / jnp.maximum(B, 1)
-
-    def gp_branch(_):
-        M = min(B, gp_subset)
-        L_sub = L[:M]
-        C_sub = cond_vec[:M]
-
-        def e_mean(L_, C_):
-            return E_apply({"params": params}, L_, C_).mean()
-
-        g = jax.grad(e_mean, argnums=0)(L_sub, C_sub)
-        return jnp.mean(jnp.square(g))
-
-    gp = lax.cond(
-        gp_lambda > 0.0, gp_branch, lambda _: jnp.array(0.0, jnp.float32), operand=None
+    margin: float,
+    chunk: int,
+):
+    B, D = cond_vec.shape
+    tau = jnp.asarray(tau, _F32)
+    cpos = lax.dynamic_slice(cond_vec, (i_idx, 0), (1, D))
+    E_pos = E_apply({"params": params}, Li[None, ...], cpos).astype(_F32)[0]
+    nseg = (B + chunk - 1) // chunk
+    B_pad, pad_n = nseg * chunk, nseg * chunk - B
+    C_pad = jnp.pad(cond_vec, ((0, pad_n), (0, 0)))
+    valid_pad = jnp.concatenate([jnp.ones((B,), bool), jnp.zeros((pad_n,), bool)])
+    init_vals = (
+        jnp.array(-jnp.inf, _F32),
+        jnp.array(0.0, _F32),
+        jnp.array(0.0, _F32),
+        jnp.array(0.0, _F32),
+        jnp.array(0.0, _F32),
     )
-    return ce + hinge_weight * hinge + gp_lambda * gp
+
+    def body(carry, s):
+        lse_all, rank_sum, s_neg, s2_neg, c_neg = carry
+        j0 = s * chunk
+        seg = lax.dynamic_slice(C_pad, (j0, 0), (chunk, D))
+        vmask = lax.dynamic_slice(valid_pad, (j0,), (chunk,))
+        is_pos = (jnp.arange(chunk, dtype=jnp.int32) + j0 == i_idx) & vmask
+        LiB = jnp.broadcast_to(Li, (chunk,) + Li.shape)
+        e_seg = E_apply({"params": params}, LiB, seg).astype(_F32)
+        dE = e_seg - E_pos
+        logits = -dE / jnp.maximum(tau, _EPS)
+        logits_masked = jnp.where(vmask, logits, -jnp.inf)
+        lse_all = jnp.logaddexp(lse_all, jax.nn.logsumexp(logits_masked))  # type: ignore
+        neg, wneg = vmask & (~is_pos), (vmask & (~is_pos)).astype(_F32)
+        rank_seg = jax.nn.softplus((margin - dE) / jnp.maximum(tau, _EPS)) * wneg
+        rank_sum += jnp.sum(rank_seg)
+        s_neg += jnp.sum(dE * wneg)
+        s2_neg += jnp.sum((dE**2) * wneg)
+        c_neg += jnp.sum(wneg)
+        return (lse_all, rank_sum, s_neg, s2_neg, c_neg), None
+
+    (lse_all, rank_sum, s_neg, s2_neg, c_neg), _ = lax.scan(
+        body, init_vals, jnp.arange(nseg)
+    )
+
+    neg_lse = lse_all + jnp.log1p(-jnp.exp(-jnp.clip(lse_all, -20.0, 20.0)) + _EPS)
+
+    rank_mean = rank_sum / jnp.maximum(c_neg, 1.0)
+    mean_neg = s_neg / jnp.maximum(c_neg, 1.0)
+    var_neg = (s2_neg / jnp.maximum(c_neg, 1.0)) - mean_neg**2
+    return neg_lse, rank_mean, var_neg
 
 
-@partial(jax.jit, static_argnames=("E_apply", "neg_k", "gp_subset"))
+def _gp_subset(E_apply, params, L, cond_vec, gp_subset: int):
+    M = int(min(L.shape[0], gp_subset))
+    e_mean = lambda L_, C_: E_apply({"params": params}, L_, C_).mean()
+    g = jax.grad(e_mean, argnums=0)(L[:M], cond_vec[:M])
+    return jnp.mean(jnp.square(g))
+
+
+def energy_total_loss_chunked(
+    E_apply,
+    params,
+    L,
+    cond_vec,
+    tau: FloatScalar,
+    gp_lambda: FloatScalar,
+    chunk: int,
+    gp_subset: int,
+):
+    L = L.astype(_F32)
+    cond_vec = cond_vec.astype(_F32)  # Sanitize cond_vec
+    tau, gp_lambda = jnp.asarray(tau, _F32), jnp.asarray(gp_lambda, _F32)
+    B = L.shape[0]
+
+    def row_body(carry, i):
+        neg_lse, rank_mean, var_neg = _row_pass_debiased(
+            E_apply, params, L[i], cond_vec, i, tau, 0.10, chunk
+        )
+        ce_i = jax.nn.softplus(neg_lse)
+        var_pen = jnp.maximum(0.0, 1e-3 - var_neg)
+        return carry + ce_i + 0.5 * rank_mean + var_pen, None
+
+    loss_sum, _ = lax.scan(row_body, jnp.array(0.0, _F32), jnp.arange(B))
+    base = loss_sum / jnp.maximum(jnp.array(B, _F32), 1.0)
+
+    def mean_diag():
+        nseg, B_pad, pad_n = (
+            (B + chunk - 1) // chunk,
+            ((B + chunk - 1) // chunk) * chunk,
+            ((B + chunk - 1) // chunk) * chunk - B,
+        )
+        L_pad, C_pad = jnp.pad(
+            L, ((0, pad_n), (0, 0), (0, 0), (0, 0), (0, 0))
+        ), jnp.pad(cond_vec, ((0, pad_n), (0, 0)))
+        mask = jnp.concatenate([jnp.ones((B,), _F32), jnp.zeros((pad_n,), _F32)])
+        body = lambda c, s: (
+            (
+                c[0]
+                + jnp.sum(
+                    E_apply(
+                        {"params": params},
+                        lax.dynamic_slice(
+                            L_pad, (s * chunk, 0, 0, 0, 0), (chunk,) + L.shape[1:]
+                        ),
+                        lax.dynamic_slice(
+                            C_pad, (s * chunk, 0), (chunk, C_pad.shape[1])
+                        ),
+                    ).astype(_F32)
+                    * lax.dynamic_slice(mask, (s * chunk,), (chunk,))
+                ),
+                c[1] + jnp.sum(lax.dynamic_slice(mask, (s * chunk,), (chunk,))),
+            ),
+            None,
+        )
+        (sum_e, sum_m), _ = lax.scan(
+            body, (jnp.array(0.0, _F32), jnp.array(0.0, _F32)), jnp.arange(nseg)
+        )
+        return sum_e / jnp.maximum(sum_m, 1.0)
+
+    center = 1e-4 * (mean_diag() ** 2)
+    gp = lax.cond(
+        gp_lambda > 0.0,
+        lambda _: _gp_subset(E_apply, params, L, cond_vec, gp_subset),
+        lambda _: jnp.array(0.0, _F32),
+        None,
+    )
+    total_loss = base + center + gp_lambda * gp
+    # MODIFIED: Convert any NaN/inf loss to 0.0 to prevent gradient poisoning.
+    return jnp.nan_to_num(total_loss)
+
+
+@partial(jax.jit, static_argnames=("E_apply", "chunk", "gp_subset"))
 def energy_step_E(
     e_state: EnergyState,
-    L: jnp.ndarray,  # (B,H,W,KS,C)
-    cond_vec: jnp.ndarray,  # (B,D)
+    L: jnp.ndarray,
+    cond_vec: jnp.ndarray,
     E_apply,
-    neg_k: int = 7,
-    gp_subset: int = 2,
+    chunk: int,
+    gp_subset: int,
 ):
-    tau = jnp.asarray(e_state.tau, jnp.float32)
-    gp_lambda = jnp.asarray(e_state.gp_lambda, jnp.float32)
+    loss_fn = lambda p: energy_total_loss_chunked(
+        E_apply, p, L, cond_vec, e_state.tau, e_state.gp_lambda, chunk, gp_subset
+    )
+    loss, grads = jax.value_and_grad(loss_fn)(e_state.params)
+    return e_state, loss, grads
 
-    def loss_e(params):
-        return energy_total_loss_subsampled(
-            E_apply,
-            params,
-            L,
-            cond_vec,
-            tau=tau,
-            gp_lambda=gp_lambda,
-            margin=0.1,
-            hinge_weight=0.25,
-            neg_k=neg_k,
-            gp_subset=gp_subset,
-        )
 
-    loss, grads = jax.value_and_grad(loss_e)(e_state.params)
+def apply_energy_updates_E(e_state: EnergyState, grads):
     updates, new_opt = e_state.tx.update(grads, e_state.opt_state, e_state.params)
     new_params = optax.apply_updates(e_state.params, updates)
-    new_state = e_state.replace(params=new_params, opt_state=new_opt)
-    return new_state, loss
+    return e_state.replace(params=new_params, opt_state=new_opt)
 
 
-@partial(jax.jit, static_argnames=("E_apply", "neg_k"))
+def _encoder_loss(
+    enc_apply,
+    enc_params,
+    y_emb,
+    feats_b,
+    set_b,
+    time_b,
+    E_apply,
+    eparams,
+    L,
+    tau,
+    chunk,
+):
+    m_emb = enc_apply({"params": enc_params}, feats_b, set_b, time_b).astype(_F32)
+    cond_all = jnp.concatenate(
+        [y_emb.astype(_F32), jnp.nan_to_num(m_emb)], axis=-1
+    )  # Sanitize m_emb
+    B = L.shape[0]
+
+    def body(sum_ce, i):
+        neg_lse, _, _ = _row_pass_debiased(
+            E_apply, eparams, L[i], cond_all, i, tau, 0.0, chunk
+        )
+        return sum_ce + jax.nn.softplus(neg_lse), None
+
+    ce_sum, _ = lax.scan(body, jnp.array(0.0, _F32), jnp.arange(B))
+    total_loss = ce_sum / jnp.maximum(jnp.array(B, _F32), 1.0)
+    # MODIFIED: Convert any NaN/inf loss to 0.0 to prevent gradient poisoning.
+    return jnp.nan_to_num(total_loss)
+
+
+@partial(jax.jit, static_argnames=("E_apply", "chunk"))
 def energy_step_encoder(
     enc_state: EncoderState,
-    y_emb: jnp.ndarray,  # (B, y_dim)
-    feats_b: jnp.ndarray,  # (B, T_max, S_max, F)
-    set_b: jnp.ndarray,  # (B, T_max, S_max, 1)
-    time_b: jnp.ndarray,  # (B, T_max, 1)
+    y_emb,
+    feats_b,
+    set_b,
+    time_b,
     E_apply,
-    eparams: FrozenDict,
-    L: jnp.ndarray,  # (B,H,W,KS,C)
-    tau: FloatScalar,
-    neg_k: int = 7,
+    eparams,
+    L,
+    tau,
+    chunk,
 ):
-    tau = jnp.asarray(tau, jnp.float32)
+    loss_fn = lambda p: _encoder_loss(
+        enc_state.apply_fn,
+        p,
+        y_emb,
+        feats_b,
+        set_b,
+        time_b,
+        E_apply,
+        eparams,
+        L,
+        tau,
+        chunk,
+    )
+    loss, grads = jax.value_and_grad(loss_fn)(enc_state.params)
+    return enc_state, loss, grads
 
-    def loss_enc(enc_params):
-        m_emb = enc_state.apply_fn(
-            {"params": enc_params}, feats_b, set_b, time_b
-        )  # (B,d)
-        cond_vec = jnp.concatenate([y_emb, m_emb], axis=-1)
-        B = L.shape[0]
 
-        def body(carry, i):
-            Li = L[i]
-            ce_i, _ = _row_loss_subsampled(
-                E_apply, eparams, Li, cond_vec, tau, margin=0.0, neg_k=neg_k, i=i
-            )
-            return carry + ce_i, None
-
-        ce_sum, _ = lax.scan(body, 0.0, jnp.arange(B))
-        return ce_sum / jnp.maximum(B, 1)
-
-    loss, grads = jax.value_and_grad(loss_enc)(enc_state.params)
+def apply_encoder_updates(enc_state: EncoderState, grads):
     updates, new_opt = enc_state.tx.update(grads, enc_state.opt_state, enc_state.params)
     new_params = optax.apply_updates(enc_state.params, updates)
-    new_state = enc_state.replace(params=new_params, opt_state=new_opt)
-    return new_state, loss
+    return enc_state.replace(params=new_params, opt_state=new_opt)
