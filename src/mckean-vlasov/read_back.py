@@ -1,5 +1,3 @@
-# Usage: python viz_generated.py --npy samples_landscapes.npy --out generated_samples
-
 import os
 import argparse
 import numpy as np
