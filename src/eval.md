@@ -19,11 +19,9 @@ Run (examples)
 ```python
 python eval_results.py \
   --real_pt ../../datasets/unified_topological_data_v6_semifast.pt \
-  --gen_glob "runs/20250821_084559/generated/samples_step020000.npy" \
+  --gen_glob "../cpu-result/samples_landscapes.npy" \
   --outdir gen_results_fig/ \
   --max_samples 2000 \
-  --pairing class \
-  --render avgk \
   --device cpu
 ```
 
