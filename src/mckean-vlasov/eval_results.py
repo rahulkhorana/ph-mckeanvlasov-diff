@@ -1,5 +1,5 @@
 # eval_results.py
-import argparse, json, math
+import argparse, json, math, os
 from pathlib import Path
 from glob import glob
 from typing import Tuple, List, Optional, Dict
@@ -33,7 +33,7 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-# Your repo loader
+# repo loader
 from dataloader import load_packed_pt
 
 
@@ -110,15 +110,14 @@ def ssim_img(a: np.ndarray, b: np.ndarray) -> float:
 class InceptionFeatures(nn.Module):
     def __init__(self, device: torch.device):
         super().__init__()
-        # Use official weights and their transforms if available
+        # Prefer official weights + transforms; keep aux head True for consistency with torchvision
         try:
             from torchvision.models import Inception_V3_Weights
 
             weights = Inception_V3_Weights.IMAGENET1K_V1
-            model = inception_v3(weights=weights, aux_logits=True)  # <-- must be True
+            model = inception_v3(weights=weights, aux_logits=True)
             self.tfm = weights.transforms()
         except Exception:
-            # Fallback for older torchvision
             weights = getattr(inception_v3, "IMAGENET1K_V1", None)
             model = inception_v3(
                 weights=weights, aux_logits=True, transform_input=False
@@ -136,13 +135,9 @@ class InceptionFeatures(nn.Module):
                     ),
                 ]
             )
-
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
-
-        # We only need the main trunk’s global avgpool features.
-        # 'avgpool' node exists regardless of aux head presence.
         self.extractor = create_feature_extractor(
             model, return_nodes={"avgpool": "feat"}
         )
@@ -157,7 +152,7 @@ class InceptionFeatures(nn.Module):
             if not batch:
                 break
             t = torch.stack([self.tfm(im.convert("RGB")) for im in batch], 0).to(self.device)  # type: ignore
-            f = self.extractor(t)["feat"].squeeze(-1).squeeze(-1)  # (N, 2048)
+            f = self.extractor(t)["feat"].squeeze(-1).squeeze(-1)  # (N,2048)
             xs.append(f.detach().cpu().numpy().astype(np.float64))
         return np.concatenate(xs, 0) if xs else np.empty((0, 2048), np.float64)
 
@@ -165,16 +160,16 @@ class InceptionFeatures(nn.Module):
 def _cov_mean(
     X: np.ndarray, shrink: float = 0.1, eps: float = 1e-6
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Ledoit-Wolf style diagonal shrinkage to avoid insane FID when N is small."""
+    """Diagonal shrinkage to keep FID sane when N is small/noisy."""
     mu = X.mean(axis=0)
     Z = X - mu
     n, d = Z.shape
     if n <= 1:
         return mu, np.eye(d, dtype=np.float64)
     S = (Z.T @ Z) / max(1, n - 1)
-    tr_d = float(np.trace(S)) / max(1, d)
-    cov = (1.0 - shrink) * S + shrink * tr_d * np.eye(d, dtype=np.float64)
-    cov = cov + (eps * tr_d + 1e-12) * np.eye(d, dtype=np.float64)
+    tr = float(np.trace(S)) / max(1, d)
+    cov = (1.0 - shrink) * S + shrink * tr * np.eye(d, dtype=np.float64)
+    cov = cov + (eps * tr + 1e-12) * np.eye(d, dtype=np.float64)
     return mu, cov
 
 
@@ -199,7 +194,6 @@ def fid_from_feats(
     val = float(d @ d + np.trace(Cr + Cf - 2.0 * Csr))
     if not np.isfinite(val):
         return None
-    # never negative due to numeric noise
     return max(val, 0.0)
 
 
@@ -219,7 +213,7 @@ def kid_from_feats(
         return None, None
     rng = rng or np.random.RandomState(123)
     m = min(subset_size, fr.shape[0], ff.shape[0])
-    if m < 20:  # too small; skip
+    if m < 20:
         return None, None
     vals = []
     for _ in range(num_subsets):
@@ -241,7 +235,7 @@ def kid_from_feats(
 
 # ----------------------- Utilities -----------------------
 def to_pil(img_uint8_hw3: np.ndarray) -> Image.Image:
-    return Image.fromarray(img_uint8_hw3)  # Pillow infers "RGB" from HxWx3 uint8
+    return Image.fromarray(img_uint8_hw3)  # HxWx3 uint8 -> RGB inferred
 
 
 def grid_image(
@@ -305,61 +299,16 @@ def save_3x3_surface_grid(vol: np.ndarray, path: Path, title: str):
     plt.close(fig)
 
 
-# ----------------------- Pseudo-label helpers -----------------------
-def mean_image_centroids(
-    imgs: List[Image.Image], labels: np.ndarray
-) -> Dict[int, np.ndarray]:
-    cents: Dict[int, np.ndarray] = {}
-    L = labels.astype(int)
-    for c in np.unique(L):
-        idx = np.where(L == c)[0]
-        if len(idx) == 0:
-            continue
-        arr = np.stack([np.asarray(imgs[i], np.float32) for i in idx], 0)
-        cents[int(c)] = arr.mean(0)
-    return cents
-
-
-def assign_by_mean_image(
-    imgs: List[Image.Image], cents: Dict[int, np.ndarray]
-) -> np.ndarray:
-    classes = np.array(sorted(cents.keys()), dtype=np.int64)
-    Cimgs = np.stack([cents[int(c)] for c in classes], 0)  # (C,H,W,3)
-    f = np.stack([np.asarray(im, np.float32) for im in imgs], 0)  # (N,H,W,3)
-    dif = f[:, None] - Cimgs[None]  # (N,C,H,W,3)
-    d2 = np.mean(dif * dif, axis=(2, 3, 4))
-    return classes[np.argmin(d2, axis=1)]
-
-
-def class_centroids_incep(
-    feats: np.ndarray, labels: np.ndarray
-) -> Dict[int, np.ndarray]:
-    cents: Dict[int, np.ndarray] = {}
-    L = labels.astype(int)
-    for c in np.unique(L):
-        idx = np.where(L == c)[0]
-        if len(idx) == 0:
-            continue
-        cents[int(c)] = feats[idx].mean(axis=0)
-    return cents
-
-
-def assign_to_centroids_incep(
-    feats: np.ndarray, cents: Dict[int, np.ndarray]
-) -> np.ndarray:
-    classes = np.array(sorted(cents.keys()), dtype=np.int64)
-    Cs = np.stack([cents[int(c)] for c in classes], 0)
-    x2 = np.sum(feats * feats, axis=1, keepdims=True)
-    c2 = np.sum(Cs * Cs, axis=1, keepdims=True).T
-    d2 = x2 + c2 - 2.0 * (feats @ Cs.T)
-    return classes[np.argmin(d2, axis=1)]
-
-
 # ----------------------- Main -----------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--real_pt", type=str, required=True)
-    ap.add_argument("--gen_glob", type=str, required=True)
+    ap.add_argument(
+        "--gen_glob",
+        type=str,
+        required=True,
+        help="Path or glob to generated .npz (preferred) or .npy files",
+    )
     ap.add_argument("--outdir", type=str, required=True)
     ap.add_argument("--max_samples", type=int, default=2000)
 
@@ -380,14 +329,7 @@ def main():
     ap.add_argument("--limit_per_class", type=int, default=1000)
     ap.add_argument("--per_class_fid", action="store_true")
     ap.add_argument(
-        "--min_fid_n", type=int, default=200, help="Skip FID/KID if any side < this"
-    )
-    ap.add_argument(
-        "--pseudo_label",
-        type=str,
-        default="inception",
-        choices=["meanrgb", "inception", "none"],
-        help="Used only if pairing=class and gen labels are missing.",
+        "--min_fid_n", type=int, default=10, help="Skip FID/KID if any side < this"
     )
     ap.add_argument("--save_3d", type=int, default=8)
     ap.add_argument("--seed", type=int, default=123)
@@ -401,18 +343,16 @@ def main():
 
     # -------- Real data --------
     pack = load_packed_pt(args.real_pt, require_modules=False)
-    if hasattr(pack, "vol"):
-        real_vol = np.asarray(pack.vol)  # type: ignore
-        real_labels = (
-            np.asarray(getattr(pack, "labels", None))
-            if hasattr(pack, "labels")
-            else None
-        )
-    elif isinstance(pack, dict) and ("vol" in pack):
+    if isinstance(pack, dict) and ("vol" in pack):
         real_vol = np.asarray(pack["vol"])
         real_labels = np.asarray(pack.get("labels")) if "labels" in pack else None
     else:
-        raise ValueError("Could not find 'vol' in loaded pack.")
+        # very defensive fallback
+        real_vol = np.asarray(getattr(pack, "vol"))
+        real_labels = (
+            np.asarray(getattr(pack, "labels")) if hasattr(pack, "labels") else None
+        )
+
     Nr_full = real_vol.shape[0]
     Nr = min(args.max_samples, Nr_full)
     real_vol = real_vol[:Nr]
@@ -420,21 +360,45 @@ def main():
         real_labels = real_labels[:Nr]
 
     # -------- Generated data --------
-    gen_files = sorted(glob(args.gen_glob))
-    if len(gen_files) == 0:
+    # Accept a single .npz file or a glob of .npz/.npy files
+    gen_matches = sorted(glob(args.gen_glob))
+    if len(gen_matches) == 0 and os.path.isfile(args.gen_glob):
+        gen_matches = [args.gen_glob]
+
+    if len(gen_matches) == 0:
         raise ValueError(f"No generated files matched: {args.gen_glob}")
-    gens = []
-    for f in gen_files:
-        arr = np.load(f)
-        if arr.ndim != 5:
-            raise ValueError(
-                f"Expected generated shape (B,H,W,K,C) in {f}, got {arr.shape}"
-            )
-        gens.append(arr)
-    gen_vol = np.concatenate(gens, axis=0)
+
+    gen_vols, gen_labels_all = [], []
+    for f in gen_matches:
+        if f.lower().endswith(".npz"):
+            z = np.load(f, allow_pickle=False)
+            if "samples" not in z:
+                raise ValueError(f"{f} missing 'samples' array")
+            gen_vols.append(z["samples"])
+            if "labels" in z:
+                gen_labels_all.append(z["labels"])
+        else:
+            arr = np.load(f)
+            if arr.ndim == 5:
+                gen_vols.append(arr)
+            elif arr.ndim == 4:
+                # allow (H,W,K,C) single sample arrays -> expand
+                gen_vols.append(arr[None])
+            else:
+                raise ValueError(
+                    f"Unsupported generated array shape in {f}: {arr.shape}"
+                )
+
+    gen_vol = np.concatenate(gen_vols, axis=0)
+    fake_labels = (
+        np.concatenate(gen_labels_all, axis=0) if len(gen_labels_all) > 0 else None
+    )
+
     Nf_full = gen_vol.shape[0]
     Nf = min(args.max_samples, Nf_full)
     gen_vol = gen_vol[:Nf]
+    if fake_labels is not None:
+        fake_labels = np.asarray(fake_labels[:Nf], dtype=np.int64)
 
     # -------- Render to RGB (uint8) --------
     real_imgs = [to_pil(render_rgb(v, args.render)) for v in real_vol]
@@ -443,7 +407,7 @@ def main():
     grid_image(real_imgs[:64], nrow=8).save(outdir / "figs/real_grid.png")
     grid_image(fake_imgs[:64], nrow=8).save(outdir / "figs/fake_grid.png")
 
-    # -------- Inception feats (for FID/KID or pseudo-label if needed) --------
+    # -------- Inception feats (for FID/KID) --------
     device = torch.device(
         args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     )
@@ -451,27 +415,63 @@ def main():
     feats_real = inc(real_imgs, batch_size=args.batch_size)
     feats_fake = inc(fake_imgs, batch_size=args.batch_size)
 
-    # -------- Pseudo-labeling (only if pairing=class and we don't have gen labels saved) --------
-    fake_labels = None
+    # -------- Pair selection for PSNR/SSIM --------
+    def choose_pairs_random(
+        Nr: int, Nf: int, rng: np.random.RandomState
+    ) -> List[Tuple[int, int]]:
+        m = min(Nr, Nf)
+        ir = rng.choice(Nr, m, replace=False)
+        jf = rng.choice(Nf, m, replace=False)
+        return list(zip(ir, jf))
+
+    # If class pairing requested, prefer the provided labels from .npz
     pseudo_mode = None
-    if args.pairing == "class":
+    if args.pairing == "paired":
+        m = min(len(real_imgs), len(fake_imgs))
+        pairs = [(i, i) for i in range(m)]
+    elif args.pairing == "class":
         if real_labels is None:
             print("[warn] real labels missing; falling back to random pairing.")
-            args.pairing = "random"
+            pairs = choose_pairs_random(len(real_imgs), len(fake_imgs), rng)
         else:
-            if args.pseudo_label == "meanrgb":
-                cents = mean_image_centroids(real_imgs, real_labels)
-                fake_labels = assign_by_mean_image(fake_imgs, cents)
-                pseudo_mode = "meanrgb"
-            elif args.pseudo_label == "inception":
-                cents = class_centroids_incep(feats_real, real_labels)
-                fake_labels = assign_to_centroids_incep(feats_fake, cents)
-                pseudo_mode = "inception"
+            if fake_labels is None:
+                print(
+                    "[warn] generated labels missing; falling back to random pairing."
+                )
+                pairs = choose_pairs_random(len(real_imgs), len(fake_imgs), rng)
             else:
-                fake_labels = None
-                pseudo_mode = "none"
-            with open(outdir / "diagnostics/pseudo_label_mode.txt", "w") as f:
-                f.write(str(pseudo_mode) + "\n")
+                gr = group_indices(real_labels)
+                gf = group_indices(fake_labels)
+                # confusion counts
+                all_keys = sorted(set(gr.keys()) | set(gf.keys()))
+                conf = {
+                    str(c): {
+                        "real_count": int(len(gr.get(c, []))),
+                        "fake_count": int(len(gf.get(c, []))),
+                    }
+                    for c in all_keys
+                }
+                with open(outdir / "diagnostics/confusion_counts.json", "w") as f:
+                    json.dump(conf, f, indent=2)
+                # pairs within class
+                pairs = []
+                for c in sorted(set(gr.keys()) & set(gf.keys())):
+                    pairs += pairs_within_class(gr[c], gf[c], args.limit_per_class, rng)
+    else:
+        pairs = choose_pairs_random(len(real_imgs), len(fake_imgs), rng)
+
+    # -------- PSNR/SSIM (2D renders) + 3D PSNR --------
+    vmin = float(np.percentile(real_vol, 0.1))
+    vmax = float(np.percentile(real_vol, 99.9))
+    data_range_3d = max(vmax - vmin, 1e-6)
+
+    psnrs, ssims, psnrs3d = [], [], []
+    for ir, jf in pairs:
+        A = np.array(real_imgs[ir], dtype=np.uint8)
+        B = np.array(fake_imgs[jf], dtype=np.uint8)
+        psnrs.append(psnr_img(A, B, data_range=255.0))
+        ssims.append(ssim_img(A, B))
+        psnrs3d.append(psnr_3d(real_vol[ir], gen_vol[jf], data_range=data_range_3d))
 
     # -------- FID/KID (global) with guards --------
     global_FID = None
@@ -487,109 +487,9 @@ def main():
             rng=np.random.RandomState(args.seed),
         )
 
-    # -------- Pair selection for PSNR/SSIM --------
-    def choose_pairs_random(
-        Nr: int, Nf: int, rng: np.random.RandomState
-    ) -> List[Tuple[int, int]]:
-        m = min(Nr, Nf)
-        ir = rng.choice(Nr, m, replace=False)
-        jf = rng.choice(Nf, m, replace=False)
-        return list(zip(ir, jf))
-
-    if args.pairing == "paired":
-        m = min(len(real_imgs), len(fake_imgs))
-        pairs = [(i, i) for i in range(m)]
-    elif args.pairing == "random" or (args.pairing == "class" and fake_labels is None):
-        if args.pairing == "class" and fake_labels is None:
-            print(
-                "[warn] pseudo-labels not available; using random pairing for PSNR/SSIM."
-            )
-        pairs = choose_pairs_random(len(real_imgs), len(fake_imgs), rng)
-    else:
-        # class pairing
-        gr = group_indices(real_labels)  # type: ignore
-        gf = group_indices(fake_labels)  # type: ignore
-        # confusion counts
-        all_keys = sorted(set(gr.keys()) | set(gf.keys()))
-        conf = {
-            str(c): {
-                "real_count": int(len(gr.get(c, []))),
-                "fake_count": int(len(gf.get(c, []))),
-            }
-            for c in all_keys
-        }
-        with open(outdir / "diagnostics/confusion_counts.json", "w") as f:
-            json.dump(conf, f, indent=2)
-        # pairs within class
-        pairs = []
-        for c in sorted(set(gr.keys()) & set(gf.keys())):
-            pairs += pairs_within_class(gr[c], gf[c], args.limit_per_class, rng)
-
-    # -------- PSNR/SSIM (2D renders) + 3D PSNR --------
-    # choose global 3D data_range from real volumes
-    vmin = float(np.percentile(real_vol, 0.1))
-    vmax = float(np.percentile(real_vol, 99.9))
-    data_range_3d = max(vmax - vmin, 1e-6)
-
-    psnrs, ssims, psnrs3d = [], [], []
-    for ir, jf in pairs:
-        A = np.array(real_imgs[ir], dtype=np.uint8)
-        B = np.array(fake_imgs[jf], dtype=np.uint8)
-        psnrs.append(psnr_img(A, B, data_range=255.0))
-        ssims.append(ssim_img(A, B))
-        psnrs3d.append(psnr_3d(real_vol[ir], gen_vol[jf], data_range=data_range_3d))
-
-    # -------- Histograms --------
-    if psnrs:
-        plt.figure(figsize=(6, 4))
-        plt.hist([x for x in psnrs if np.isfinite(x)], bins=50)
-        plt.title(f"PSNR (render={args.render}, pairing={args.pairing})")
-        plt.tight_layout()
-        plt.savefig(outdir / "figs/psnr_hist.png")
-        plt.close()
-    if ssims and np.isfinite(np.nanmean(ssims)):
-        plt.figure(figsize=(6, 4))
-        plt.hist([x for x in ssims if np.isfinite(x)], bins=50)
-        plt.title(f"SSIM (render={args.render}, pairing={args.pairing})")
-        plt.tight_layout()
-        plt.savefig(outdir / "figs/ssim_hist.png")
-        plt.close()
-
-    # -------- 3D viridis snapshots --------
-    n3d = max(0, int(args.save_3d))
-    for i in range(min(n3d, len(real_vol))):
-        save_3x3_surface_grid(real_vol[i], outdir / f"figs/real_{i:03d}.png", "real")
-    for i in range(min(n3d, len(gen_vol))):
-        save_3x3_surface_grid(gen_vol[i], outdir / f"figs/fake_{i:03d}.png", "fake")
-
-    # -------- Save paired grid for quick eyeballing --------
-    show_pairs = pairs[:64]
-    tiles = []
-    for ir, jf in show_pairs:
-        A = real_imgs[ir].copy()
-        B = fake_imgs[jf].copy()
-        w, h = A.size
-        canv = Image.new("RGB", (w * 2 + 4, h), (255, 255, 255))
-        canv.paste(A, (0, 0))
-        canv.paste(B, (w + 4, 0))
-        tiles.append(canv)
-    if tiles:
-        grid_image(tiles, nrow=8).save(outdir / "figs/pairs_grid.png")
-
-    # -------- Write metrics --------
-    def _nanmean(x):
-        return float(np.nanmean(x)) if len(x) else float("nan")
-
-    def _nanstd(x):
-        return float(np.nanstd(x)) if len(x) else float("nan")
-
+    # -------- Per-class FID/KID (optional) --------
     per_class: Dict[str, Dict[str, Optional[float]]] = {}
-    if (
-        args.per_class_fid
-        and args.pairing == "class"
-        and (fake_labels is not None)
-        and (real_labels is not None)
-    ):
+    if args.per_class_fid and (real_labels is not None) and (fake_labels is not None):
         gr = group_indices(real_labels)
         gf = group_indices(fake_labels)
         for c in sorted(set(gr.keys()) & set(gf.keys())):
@@ -615,6 +515,50 @@ def main():
                 "KID_std": None if KID_s is None else float(KID_s),
             }
 
+    # -------- Histograms --------
+    if psnrs:
+        plt.figure(figsize=(6, 4))
+        plt.hist([x for x in psnrs if np.isfinite(x)], bins=50)
+        plt.title(f"PSNR (render={args.render}, pairing={args.pairing})")
+        plt.tight_layout()
+        plt.savefig(outdir / "figs/psnr_hist.png")
+        plt.close()
+    if ssims and np.isfinite(np.nanmean(ssims)):
+        plt.figure(figsize=(6, 4))
+        plt.hist([x for x in ssims if np.isfinite(x)], bins=50)
+        plt.title(f"SSIM (render={args.render}, pairing={args.pairing})")
+        plt.tight_layout()
+        plt.savefig(outdir / "figs/ssim_hist.png")
+        plt.close()
+
+    # -------- 3D viridis snapshots --------
+    n3d = max(0, int(args.save_3d))
+    for i in range(min(n3d, len(real_vol))):
+        save_3x3_surface_grid(real_vol[i], outdir / f"figs/real_{i:03d}.png", "real")
+    for i in range(min(n3d, len(gen_vol))):
+        save_3x3_surface_grid(gen_vol[i], outdir / f"figs/fake_{i:03d}.png", "fake")
+
+    # -------- Save paired grid for eyeballing --------
+    show_pairs = pairs[:64]
+    tiles = []
+    for ir, jf in show_pairs:
+        A = real_imgs[ir].copy()
+        B = fake_imgs[jf].copy()
+        w, h = A.size
+        canv = Image.new("RGB", (w * 2 + 4, h), (255, 255, 255))
+        canv.paste(A, (0, 0))
+        canv.paste(B, (w + 4, 0))
+        tiles.append(canv)
+    if tiles:
+        grid_image(tiles, nrow=8).save(outdir / "figs/pairs_grid.png")
+
+    # -------- Write metrics --------
+    def _nanmean(x):
+        return float(np.nanmean(x)) if len(x) else float("nan")
+
+    def _nanstd(x):
+        return float(np.nanstd(x)) if len(x) else float("nan")
+
     metrics = {
         "counts": {"real": int(Nr), "fake": int(Nf), "pairs": int(len(pairs))},
         "render_mode": args.render,
@@ -635,7 +579,7 @@ def main():
             "gen_glob": args.gen_glob,
             "device_used": str(device),
             "min_fid_n": int(args.min_fid_n),
-            "pseudo_label": str(pseudo_mode) if args.pairing == "class" else "n/a",
+            "has_gen_labels": bool(fake_labels is not None),
         },
     }
     with open(outdir / "metrics.json", "w") as f:
