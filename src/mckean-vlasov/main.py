@@ -189,7 +189,7 @@ def main():
     F = 13 + 16  # featurizer dim for S_max=16 with pos ids
     feats_d = jnp.zeros((1, 1, 16, F), jnp.float32)
     set_d = jnp.zeros((1, 1, 16, 1), jnp.float32)
-    tim_d = jnp.ones((1, 1, 1), jnp.float32)
+    tim_d = jnp.ones((1, 1, 1, 1), jnp.float32)
     enc_params = enc.init(k_enc, feats_d, set_d, tim_d)["params"]
     mods_embed_fn = build_mods_embedder(enc)
 

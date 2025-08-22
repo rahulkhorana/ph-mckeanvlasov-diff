@@ -1,48 +1,29 @@
+# losses_steps.py
 from __future__ import annotations
 from typing import Callable, Tuple
-from dataclasses import replace as dc_replace
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 from flax import struct
 from flax.core import FrozenDict
 import optax
-from jax.tree_util import tree_map
+from dataclasses import replace as dc_replace
 
-# ------------------ dtypes ------------------
+
 _F32 = jnp.float32
 _I32 = jnp.int32
 
 
-# ------------------ cosine schedule ------------------
-def _cosine_alpha_bars(T: int, s: float = 0.008) -> jnp.ndarray:
-    steps = jnp.arange(T + 1, dtype=_F32)
-    f = jnp.cos(((steps / T + s) / (1.0 + s)) * jnp.pi * 0.5) ** 2
-    f = f / f[0]
-    alpha_bars = f[1:]
-    alpha_bars = jnp.clip(alpha_bars, 1e-6, 1.0)
-    return alpha_bars.astype(_F32)
-
-
-def _alphas_from_alpha_bars(alpha_bars: jnp.ndarray) -> jnp.ndarray:
-    prev = jnp.concatenate([jnp.array([1.0], _F32), alpha_bars[:-1]], axis=0)
-    alphas = jnp.sqrt(alpha_bars / prev)
-    alphas = jnp.clip(alphas, 1e-6, 1.0)
-    return alphas
-
-
-def _betas_from_alphas(alphas: jnp.ndarray) -> jnp.ndarray:
-    betas = 1.0 - (alphas**2)
-    betas = jnp.clip(betas, 1e-8, 0.999)
-    return betas
-
-
-# ------------------ time embedding (sinusoidal) ------------------
-def _positional_embedding_sin(x: jnp.ndarray, dim: int = 128) -> jnp.ndarray:
+# -----------------------------
+# Sinusoidal time embedding
+# -----------------------------
+def _time_embed(t: jnp.ndarray, dim: int) -> jnp.ndarray:
+    """t: (B,) -> (B, dim), JIT-safe (dim is a Python int)."""
+    t = jnp.asarray(t, _F32)
     half = dim // 2
+    # frequencies in log space [1, 10k]
     freqs = jnp.exp(jnp.linspace(jnp.log(1.0), jnp.log(10000.0), half, dtype=_F32))
-    ang = x[:, None] * freqs[None, :]
+    ang = t[:, None] * freqs[None, :]
     emb = jnp.concatenate([jnp.sin(ang), jnp.cos(ang)], axis=-1)
     if emb.shape[-1] < dim:
         pad = jnp.zeros((emb.shape[0], dim - emb.shape[-1]), dtype=_F32)
@@ -50,46 +31,64 @@ def _positional_embedding_sin(x: jnp.ndarray, dim: int = 128) -> jnp.ndarray:
     return emb.astype(_F32)
 
 
-# ------------------ Charbonnier loss ------------------
-def _charbonnier(x: jnp.ndarray, eps: float = 1e-3) -> jnp.ndarray:
-    eps32 = jnp.array(eps, _F32)
-    return jnp.sqrt(x * x + eps32 * eps32)
+# -----------------------------
+# Noise schedules (cosine / linear)
+# -----------------------------
+def _make_cosine_schedule(
+    T: int, s: float = 0.008
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Returns betas, alphas, alpha_bars of length T (float32).
+    """
+    steps = jnp.arange(T + 1, dtype=_F32)
+    t = steps / jnp.array(T, _F32)
+    f = jnp.cos((t + s) / (1.0 + s) * jnp.pi / 2.0) ** 2
+    alpha_bars = (f / f[0]).clip(1e-7, 1.0)  # (T+1,)
+    ab_t = alpha_bars[1:]
+    ab_prev = alpha_bars[:-1]
+    betas = (1.0 - (ab_t / ab_prev)).clip(1e-7, 0.999)
+    alphas = 1.0 - betas
+    return betas.astype(_F32), alphas.astype(_F32), ab_t.astype(_F32)
 
 
-# ------------------ SNR utilities ------------------
-def _snr_from_alpha_bar(alpha_bar_t: jnp.ndarray) -> jnp.ndarray:
-    return alpha_bar_t / jnp.maximum(1.0 - alpha_bar_t, jnp.array(1e-6, _F32))
+def _make_linear_schedule(
+    T: int, beta_start: float = 1e-4, beta_end: float = 2e-2
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    betas = jnp.linspace(beta_start, beta_end, T, dtype=_F32).clip(1e-8, 0.999)
+    alphas = 1.0 - betas
+    alpha_bars = jnp.cumprod(alphas, axis=0).astype(_F32)
+    return betas.astype(_F32), alphas.astype(_F32), alpha_bars.astype(_F32)
 
 
-def _snr_weight(alpha_bar_t: jnp.ndarray, snr_clip: float) -> jnp.ndarray:
-    snr = _snr_from_alpha_bar(alpha_bar_t)
-    return jnp.minimum(snr, jnp.array(snr_clip, _F32))
-
-
-# ------------------ Diffusion state ------------------
+# -----------------------------
+# State container
+# -----------------------------
 @struct.dataclass
 class DiffusionState:
-    # non-pytree
+    # non-pytrees (static / JIT-constant config)
     apply_fn: Callable = struct.field(pytree_node=False)  # unet.apply
-    tx: optax.GradientTransformation = struct.field(pytree_node=False)
+    T: int = struct.field(pytree_node=False)  # number of steps
+    v_prediction: bool = struct.field(
+        pytree_node=False
+    )  # True = v-pred, False = eps-pred
+    t_embed_dim: int = struct.field(pytree_node=False)  # time embedding dim (e.g., 128)
+    ema_decay: float = struct.field(pytree_node=False)  # EMA decay for params
+    snr_gamma: float = struct.field(pytree_node=False)  # power for SNR weight
+    charbonnier_eps: float = struct.field(pytree_node=False)  # epsilon for Charbonnier
 
-    # pytree
+    # pytree params / optimizer
     params: FrozenDict
     ema_params: FrozenDict
     opt_state: optax.OptState
+    tx: optax.GradientTransformation = struct.field(pytree_node=False)
 
-    # schedule
-    betas: jnp.ndarray  # (T,)
-    alphas: jnp.ndarray  # (T,)
-    alpha_bars: jnp.ndarray  # (T,)
+    # schedules (pytree)
+    betas: jnp.ndarray
+    alphas: jnp.ndarray
+    alpha_bars: jnp.ndarray
 
-    # config
-    v_prediction: jnp.ndarray  # () bool-array
-    ema_decay: jnp.ndarray  # () f32
-    snr_clip: jnp.ndarray  # () f32
-    use_snr_weight: jnp.ndarray  # () bool-array
-    charbonnier_eps: jnp.ndarray  # () f32
-    t_embed_dim: jnp.ndarray  # () i32
+    # rng for internal use (optional)
+    rng: jnp.ndarray
 
     def replace(self, **updates):
         return dc_replace(self, **updates)
@@ -97,108 +96,138 @@ class DiffusionState:
 
 def create_diffusion_state(
     *,
-    rng,
+    rng: jnp.ndarray,
     apply_fn: Callable,
     init_params: FrozenDict,
-    T: int,
-    lr: float,
-    v_prediction: bool,
+    T: int = 1000,
+    lr: float = 2e-4,
+    v_prediction: bool = True,
     schedule: str = "cosine",
     ema_decay: float = 0.999,
-    snr_clip: float = 5.0,
-    use_snr_weight: bool = True,
-    charbonnier_eps: float = 1e-3,
-    t_embed_dim: int = 128,
-    weight_decay: float = 1e-4,
-    grad_clip: float = 1.0,
+    snr_gamma: float = 0.5,  # SNR weighting gamma
+    charbonnier_eps: float = 1e-3,  # Charbonnier epsilon
 ) -> DiffusionState:
-    if schedule != "cosine":
-        raise ValueError("Only 'cosine' schedule is implemented in this file.")
+    if schedule == "cosine":
+        betas, alphas, alpha_bars = _make_cosine_schedule(T)
+    elif schedule == "linear":
+        betas, alphas, alpha_bars = _make_linear_schedule(T)
+    else:
+        raise ValueError(f"Unknown schedule: {schedule}")
 
-    alpha_bars = _cosine_alpha_bars(T)
-    alphas = _alphas_from_alpha_bars(alpha_bars)
-    betas = _betas_from_alphas(alphas)
-
-    tx = optax.chain(
-        optax.clip_by_global_norm(grad_clip),
-        optax.adamw(learning_rate=lr, weight_decay=weight_decay),
-    )
+    tx = optax.adamw(learning_rate=lr, weight_decay=0.0)
 
     return DiffusionState(
         apply_fn=apply_fn,
-        tx=tx,
+        T=int(T),
+        v_prediction=bool(v_prediction),
+        t_embed_dim=128,  # keep in sync with UNet / models.time_embed
+        ema_decay=float(ema_decay),
+        snr_gamma=float(snr_gamma),
+        charbonnier_eps=float(charbonnier_eps),
         params=init_params,
         ema_params=init_params,
         opt_state=tx.init(init_params),
+        tx=tx,
         betas=betas,
         alphas=alphas,
         alpha_bars=alpha_bars,
-        v_prediction=jnp.array(bool(v_prediction)),
-        ema_decay=jnp.array(ema_decay, _F32),
-        snr_clip=jnp.array(snr_clip, _F32),
-        use_snr_weight=jnp.array(bool(use_snr_weight)),
-        charbonnier_eps=jnp.array(charbonnier_eps, _F32),
-        t_embed_dim=jnp.array(int(t_embed_dim), _I32),
+        rng=rng,
     )
 
 
-def _gather_t(arr: jnp.ndarray, t_idx: jnp.ndarray) -> jnp.ndarray:
-    return arr[t_idx]
+# -----------------------------
+# Loss helpers
+# -----------------------------
+def _snr_weight(alpha_bar_t: jnp.ndarray, gamma: float) -> jnp.ndarray:
+    """
+    alpha_bar_t: (B,)
+    w = (snr^gamma) / (snr^gamma + 1),  snr = alpha_bar / (1 - alpha_bar)
+    """
+    snr = (alpha_bar_t / jnp.maximum(1.0 - alpha_bar_t, 1e-7)).astype(_F32)
+    w = (snr**gamma) / (snr**gamma + 1.0)
+    return w.astype(_F32)
 
 
-@jax.jit
+def _charbonnier(x: jnp.ndarray, eps: float) -> jnp.ndarray:
+    return jnp.sqrt(x * x + jnp.array(eps, _F32) ** 2)
+
+
+def _ema_update(ema_params: FrozenDict, params: FrozenDict, decay: float) -> FrozenDict:
+    return jax.tree_util.tree_map(
+        lambda e, p: decay * e + (1.0 - decay) * p, ema_params, params
+    )
+
+
+# -----------------------------
+# Training step
+# -----------------------------
 def diffusion_train_step(
     state: DiffusionState,
-    x0: jnp.ndarray,  # (B,H,W,KS,C)
-    rng: jnp.ndarray,
-    v_prediction_flag: bool,  # unused; kept for API compatibility
-    cond_vec: jnp.ndarray,  # (B, cond_dim)
+    x0: jnp.ndarray,  # (B,H,W,K,C)
+    rng: jnp.ndarray,  # PRNGKey
+    v_pred_flag: bool,  # kept for API compatibility; ignored (state.v_prediction)
+    cond_vec: jnp.ndarray,  # (B, D)
 ) -> Tuple[DiffusionState, jnp.ndarray]:
+    """
+    One training step with Charbonnier + SNR-weighted loss.
+    JIT-safe: all dynamic sizes avoided, config is static on the state.
+    """
+    del v_pred_flag  # always use state.v_prediction
+
     B = x0.shape[0]
-    T = state.alpha_bars.shape[0]
+    T = state.T
 
-    rng, k_t, k_eps = jax.random.split(rng, 3)
-    t_idx = jax.random.randint(k_t, (B,), 0, T, dtype=_I32)  # [0..T-1]
-    alpha_bar_t = _gather_t(state.alpha_bars, t_idx)  # (B,)
-    a = jnp.sqrt(alpha_bar_t)[..., None, None, None, None]
-    s = jnp.sqrt(jnp.maximum(1.0 - alpha_bar_t, jnp.array(1e-6, _F32)))[
-        ..., None, None, None, None
-    ]
+    def loss_fn(params):
+        # sample t in [0, T-1]
+        rng1, rng2 = jax.random.split(rng)
+        t_idx = jax.random.randint(rng1, (B,), minval=0, maxval=T, dtype=_I32)  # (B,)
+        a_bar = state.alpha_bars[t_idx]  # (B,)
+        a = jnp.sqrt(a_bar)  # (B,)
+        sig = jnp.sqrt(jnp.maximum(1.0 - a_bar, 1e-8))  # (B,)
 
-    eps = jax.random.normal(k_eps, shape=x0.shape, dtype=_F32)
-    xt = a * x0 + s * eps
+        # noise and x_t
+        eps = jax.random.normal(rng2, x0.shape, dtype=_F32)
+        a_ = a.reshape((B,) + (1,) * (x0.ndim - 1))
+        s_ = sig.reshape((B,) + (1,) * (x0.ndim - 1))
+        xt = a_ * x0 + s_ * eps
 
-    t_frac = (t_idx.astype(_F32) + 0.5) / jnp.array(T, _F32)
-    t_emb = _positional_embedding_sin(t_frac, int(state.t_embed_dim))
+        # time embedding
+        t_frac = (t_idx.astype(_F32) + 0.5) / jnp.array(T, _F32)  # (B,)
+        t_emb = _time_embed(t_frac, state.t_embed_dim)  # (B, t_dim)
 
-    def _loss_with_params(p):
-        pred = state.apply_fn({"params": p}, xt, t_emb, cond_vec).astype(_F32)
-        if bool(state.v_prediction):
-            v_tgt = a * eps - s * x0
-            diff = pred - v_tgt
+        # model prediction
+        pred = state.apply_fn({"params": params}, xt, t_emb, cond_vec).astype(_F32)
+
+        # build training target and score conversion
+        if state.v_prediction:
+            # v = a * eps - sig * x0
+            target = a_ * eps - s_ * x0
+            diff = pred - target
         else:
-            diff = pred - eps
+            # eps-pred
+            target = eps
+            diff = pred - target
 
-        char = _charbonnier(diff, float(state.charbonnier_eps))
-        per_sample = jnp.mean(char, axis=tuple(range(1, char.ndim)))  # (B,)
+        # Charbonnier + SNR weighting
+        per_voxel = _charbonnier(diff, state.charbonnier_eps)  # (B, H,W,K,C)
+        per_ex = jnp.mean(per_voxel, axis=tuple(range(1, x0.ndim)))  # (B,)
+        w = _snr_weight(a_bar, state.snr_gamma)  # (B,)
+        loss = jnp.mean(w * per_ex)  # scalar
 
-        if bool(state.use_snr_weight):
-            w = _snr_weight(alpha_bar_t, float(state.snr_clip))
-            per_sample = per_sample * w
+        return loss
 
-        return jnp.mean(per_sample).astype(_F32)
-
-    loss, grads = jax.value_and_grad(_loss_with_params)(state.params)
-
+    grads = jax.grad(loss_fn)(state.params)
     updates, new_opt = state.tx.update(grads, state.opt_state, state.params)
     new_params = optax.apply_updates(state.params, updates)
-
-    ema = float(state.ema_decay)
-    new_ema_params = tree_map(
-        lambda e, p: ema * e + (1.0 - ema) * p, state.ema_params, new_params
-    )
+    new_ema = _ema_update(state.ema_params, new_params, state.ema_decay)  # type: ignore
 
     new_state = state.replace(
-        params=new_params, ema_params=new_ema_params, opt_state=new_opt
+        params=new_params,
+        ema_params=new_ema,
+        opt_state=new_opt,
+        rng=jax.random.fold_in(state.rng, 1),
     )
-    return new_state, loss
+
+    # Recompute loss for logging (cheap)
+    loss_val = loss_fn(new_params)
+    return new_state, loss_val
