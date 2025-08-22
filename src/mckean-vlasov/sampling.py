@@ -1,305 +1,336 @@
+from __future__ import annotations
+from typing import Callable, Optional, Tuple, Literal
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-from typing import Callable, Optional, Tuple, Literal
 
-from models import time_embed
+from models import (
+    time_embed as time_embed_fn,
+)
 
-
-# -------------------------------------------------
-# Energy guidance (modules+label already in cond_vec)
-# -------------------------------------------------
-def make_energy_guidance(
-    E_apply: Callable,
-    eparams,
-    cond_vec: jnp.ndarray,
-) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    """
-    Returns guidance(x, t_cont) -> ∇_x mean E(x, cond_vec).
-    cond_vec is fixed for a sampling call: shape (B, D).
-    """
-
-    def e_mean(x: jnp.ndarray) -> jnp.ndarray:
-        e = E_apply({"params": eparams}, x, cond_vec)  # (B,)
-        return jnp.mean(e)
-
-    grad_fn = jax.grad(e_mean)
-
-    def guidance(x: jnp.ndarray, t_cont: jnp.ndarray) -> jnp.ndarray:
-        # t_cont kept for API symmetry; you can time-gate guidance outside if desired.
-        return grad_fn(x)
-
-    return guidance
+_F32 = jnp.float32
 
 
-# -------------------------------------------------
-# Small helpers
-# -------------------------------------------------
-def _v_to_eps(v_pred: jnp.ndarray, x: jnp.ndarray, a_bar: jnp.ndarray) -> jnp.ndarray:
-    """
-    Convert v-prediction to eps_hat.
-      eps_hat = sqrt(a_bar) * v + sqrt(1 - a_bar) * x
-    Shapes:
-      v_pred, x: (B,H,W,K,C)
-      a_bar:     (B,1,1,1,1)
-    """
-    sqrt_ab = jnp.sqrt(a_bar)
-    sqrt_1ab = jnp.sqrt(jnp.clip(1.0 - a_bar, 1e-8, None))
-    return sqrt_ab * v_pred + sqrt_1ab * x
+# =============================== numerics helpers ===============================
 
 
-def _score_from_eps(eps_hat: jnp.ndarray, a_bar: jnp.ndarray) -> jnp.ndarray:
-    """
-    VP score: s_theta(x,t) ≈ - eps_hat / sigma_t,  sigma_t = sqrt(1 - a_bar).
-    """
-    sigma_t = jnp.sqrt(jnp.clip(1.0 - a_bar, 1e-8, None))
-    return -eps_hat / sigma_t
+def _nn(x: jnp.ndarray) -> jnp.ndarray:
+    """Clamp & de-NaN for stability."""
+    x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return jnp.clip(x, -1e6, 1e6).astype(_F32)
 
 
-def _time_weight(
-    t_cont: jnp.ndarray, kind: Literal["linear", "cosine", "exp"], strength: float
-) -> jnp.ndarray:
-    """
-    Returns a scalar weight per batch element in [0, 1] to anneal guidance/CFG over time.
-    t_cont in [0,1], 1 = early, 0 = final.
-    """
-    t = jnp.clip(t_cont, 0.0, 1.0)
+def _sched_factor(kind: str, t_idx: int, T: int, strength: float) -> jnp.ndarray:
+    """Time schedule in [0,1]; larger late in sampling (low noise)."""
+    Tm1 = max(1, T - 1)
+    frac = 1.0 - (jnp.array(t_idx, _F32) / jnp.array(Tm1, _F32))  # 0->1
     if kind == "linear":
-        w = t  # strong early, fades to 0
+        f = frac
     elif kind == "cosine":
-        w = 0.5 * (1.0 + jnp.cos(jnp.pi * (1.0 - t)))  # smooth
-    else:  # "exp"
-        w = jnp.exp(-strength * (1.0 - t))
-    return jnp.clip(w, 0.0, 1.0)
-
-
-# -------------------------------------------------
-# Mean-field interactions (McKean–Vlasov)
-# -------------------------------------------------
-def _mf_voxel_mean(x: jnp.ndarray, lam: float) -> jnp.ndarray:
-    """
-    Voxelwise mean-field repulsion:
-      F_mf = lam * (x - mean_over_batch(x))
-    This pushes each sample away from the batch mean at every voxel.
-    """
-    if lam <= 0.0:
-        return jnp.zeros_like(x)
-    mu = jnp.mean(x, axis=0, keepdims=True)  # (1,H,W,K,C)
-    return lam * (x - mu)
-
-
-def _mf_global_rbf(x: jnp.ndarray, lam: float, h: float) -> jnp.ndarray:
-    """
-    Global RBF repulsion in a compact embedding:
-      - Summarize each sample by φ = mean over (H,W,K) -> (B,C).
-      - Repel using RBF kernel in that C-dim space, broadcast to a bias field.
-    """
-    if lam <= 0.0 or h <= 0.0:
-        return jnp.zeros_like(x)
-
-    B = x.shape[0]
-    phi = jnp.mean(x, axis=(1, 2, 3))  # (B,C)
-    diff = phi[:, None, :] - phi[None, :, :]  # (B,B,C)
-    d2 = jnp.sum(diff * diff, axis=-1)  # (B,B)
-    h2 = jnp.clip(h * h, 1e-8, None)
-    K = jnp.exp(-d2 / h2)  # (B,B)
-    rep_phi = (K[..., None] * (-diff)).sum(axis=1) / h2  # (B,C)
-    rep_phi = rep_phi / max(B, 1)
-    rep_field = rep_phi[:, None, None, None, :]  # (B,1,1,1,C)
-    return lam * rep_field
-
-
-# -------------------------------------------------
-# UNet → eps helper (handles v-pred)
-# -------------------------------------------------
-def _eps_hat_from_unet(
-    unet_apply: Callable,
-    params,
-    x: jnp.ndarray,
-    t_cont: jnp.ndarray,  # (B,)
-    cond_vec: jnp.ndarray,  # (B,D)
-    a_bar_b: jnp.ndarray,  # (B,1,1,1,1)
-    v_prediction: bool,
-) -> jnp.ndarray:
-    temb = time_embed(t_cont, dim=128)  # (B,128)
-    pred = unet_apply({"params": params}, x, temb, cond_vec)  # (B,H,W,K,C)
-    if v_prediction:
-        return _v_to_eps(pred, x, a_bar_b)
+        f = jnp.sin(0.5 * jnp.pi * frac) ** 2
+    elif kind == "exp":
+        # convex ramp; 'strength' controls curvature
+        k = jnp.array(max(1e-6, strength), _F32)
+        f = (jnp.exp(frac * k) - 1.0) / (jnp.exp(k) - 1.0 + 1e-8)
     else:
-        return pred
+        f = frac
+    return jnp.clip(f, 0.0, 1.0).astype(_F32)
 
 
-# -------------------------------------------------
-# McKean–Vlasov reverse SDE sampler (with CFG + energy)
-# -------------------------------------------------
+def _linspace_indices(T: int, steps: int) -> jnp.ndarray:
+    """T discrete steps [0..T-1] → pick `steps` integers from T-1 down to 0."""
+    steps = int(max(1, steps))
+    t_float = jnp.linspace(T - 1, 0, steps)
+    return jnp.round(t_float).astype(jnp.int32)
+
+
+def _abar_at(alpha_bars: jnp.ndarray, idx: int) -> jnp.ndarray:
+    """ᾱ_{idx}; if idx<0 return 1.0 (by convention for DDIM last jump)."""
+    return jnp.where(idx >= 0, alpha_bars[idx], jnp.array(1.0, _F32))
+
+
+def _to_eps_from_model(
+    x_t: jnp.ndarray,
+    model_out: jnp.ndarray,
+    alpha_bar_t: jnp.ndarray,
+    v_prediction: bool,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    From model output (v or eps) return:
+      eps_pred, x0_pred, sigma_t  (with sigma_t = sqrt(1-ᾱ_t))
+    Relations for v-pred (Imagen/StableDiffusion convention):
+      x_t = c0 x0 + c1 eps, v = c0 eps - c1 x0,
+      c0 = sqrt(ᾱ_t), c1 = sqrt(1-ᾱ_t)
+      => eps = c1*x + c0*v,  x0 = c0*x - c1*v
+    """
+    c0 = jnp.sqrt(jnp.clip(alpha_bar_t, 1e-8, 1.0))
+    c1 = jnp.sqrt(jnp.clip(1.0 - alpha_bar_t, 1e-8, 1.0))
+    if v_prediction:
+        v = model_out
+        eps = c1 * x_t + c0 * v
+        x0 = c0 * x_t - c1 * v
+    else:
+        eps = model_out
+        x0 = (x_t - c1 * eps) / jnp.maximum(c0, 1e-8)
+    sigma_t = c1
+    return _nn(eps), _nn(x0), sigma_t
+
+
+def _ddim_sigma(
+    alpha_bar_t: jnp.ndarray, alpha_bar_prev: jnp.ndarray, eta: float
+) -> jnp.ndarray:
+    """
+    DDIM noise scale σ_t for jump t -> t-1 with stride Δ.
+    σ_t = η * sqrt((1-ᾱ_{t-1})/(1-ᾱ_t) * (1 - ᾱ_t/ᾱ_{t-1})) * sqrt(1-ᾱ_t)
+        = η * sqrt( (1-ᾱ_{t-1}) - (1-ᾱ_t) * ᾱ_t/ᾱ_{t-1} )
+    """
+    eps = jnp.array(1e-8, _F32)
+    a_t = jnp.clip(alpha_bar_t, eps, 1.0)
+    a_s = jnp.clip(alpha_bar_prev, eps, 1.0)
+    # use the standard two-factor form for better numerical stability
+    frac = jnp.sqrt(jnp.clip((1.0 - a_s) / (1.0 - a_t), 0.0, 1e8))
+    inner = jnp.sqrt(jnp.clip(1.0 - a_t / a_s, 0.0, 1.0))
+    return jnp.array(eta, _F32) * frac * inner * jnp.sqrt(jnp.clip(1.0 - a_t, 0.0, 1.0))
+
+
+# =============================== mean-field coupling ===============================
+
+
+def _pad_edges(x: jnp.ndarray) -> jnp.ndarray:
+    # replicate pad on (H,W,K) dims
+    B, H, W, K, C = x.shape
+    x0 = x[:, :1, :, :, :]
+    x1 = x[:, -1:, :, :, :]
+    x = jnp.concatenate([x0, x, x1], axis=1)
+    y0 = x[:, :, :1, :, :]
+    y1 = x[:, :, -1:, :, :]
+    x = jnp.concatenate([y0, x, y1], axis=2)
+    z0 = x[:, :, :, :1, :]
+    z1 = x[:, :, :, -1:, :]
+    x = jnp.concatenate([z0, x, z1], axis=3)
+    return x  # (B,H+2,W+2,K+2,C)
+
+
+def _neighbors6(x: jnp.ndarray) -> Tuple[jnp.ndarray, ...]:
+    """Return the 6 direct neighbors (±x, ±y, ±z) with edge replication."""
+    B, H, W, K, C = x.shape
+    p = _pad_edges(x)
+    # shifts: (±1,0,0), (0,±1,0), (0,0,±1) relative to padded volume
+    xp = p[:, 2:, 1:-1, 1:-1, :]  # +x
+    xm = p[:, :-2, 1:-1, 1:-1, :]  # -x
+    yp = p[:, 1:-1, 2:, 1:-1, :]  # +y
+    ym = p[:, 1:-1, :-2, 1:-1, :]  # -y
+    zp = p[:, 1:-1, 1:-1, 2:, :]  # +z
+    zm = p[:, 1:-1, 1:-1, :-2, :]  # -z
+    return xp, xm, yp, ym, zp, zm
+
+
+def _mf_voxel(x: jnp.ndarray, bandwidth: float) -> jnp.ndarray:
+    """Laplacian-like smoothing gradient: sum(nei - 6*x)."""
+    xp, xm, yp, ym, zp, zm = _neighbors6(x)
+    lap = (xp + xm + yp + ym + zp + zm) - 6.0 * x
+    # scale by bandwidth (acts like step size)
+    return _nn(lap * jnp.array(bandwidth, _F32))
+
+
+def _mf_rbf(x: jnp.ndarray, bandwidth: float) -> jnp.ndarray:
+    """
+    Bilateral-like local interaction: Σ_nei exp(-||δ||^2 / (2 h^2)) * δ,
+    δ = nei - x. This is ∇ of a local RBF-kernel energy → smoothing.
+    """
+    h2 = jnp.array(max(1e-6, bandwidth) ** 2, _F32)
+    xp, xm, yp, ym, zp, zm = _neighbors6(x)
+    out = jnp.zeros_like(x)
+    for nei in (xp, xm, yp, ym, zp, zm):
+        d = nei - x
+        # channel-wise squared norm
+        d2 = jnp.sum(d * d, axis=-1, keepdims=True)
+        w = jnp.exp(-d2 / (2.0 * h2))
+        out = out + w * d
+    return _nn(out)
+
+
+def _mean_field_grad(x: jnp.ndarray, mode: str, bandwidth: float) -> jnp.ndarray:
+    if mode == "voxel":
+        return _mf_voxel(x, bandwidth)
+    elif mode == "rbf":
+        return _mf_rbf(x, bandwidth)
+    else:
+        return jnp.zeros_like(x)
+
+
+# =============================== energy guidance ===============================
+
+
+def make_energy_guidance(
+    E_apply: Callable,  # E({"params": p}, x, cond) -> (B,) energy
+    eparams,
+    cond_vec: jnp.ndarray,  # (B, D)
+) -> Callable[[jnp.ndarray], jnp.ndarray]:
+    """
+    Returns a function grad_fn(x) = ∇_x ( -E(x, cond) ), batched over B.
+    """
+
+    def energy_single(x_i: jnp.ndarray, cond_i: jnp.ndarray) -> jnp.ndarray:
+        # x_i: (H,W,K,C), cond_i: (D,)
+        e = E_apply({"params": eparams}, x_i[None, ...], cond_i[None, ...]).reshape(())
+        return -e  # ascend direction (adds to score)
+
+    v_energy = jax.vmap(jax.grad(energy_single), in_axes=(0, 0))
+
+    def grad_fn(x: jnp.ndarray) -> jnp.ndarray:
+        return _nn(v_energy(x, cond_vec))
+
+    return grad_fn
+
+
+# =============================== main sampler ===============================
+
+
 def mv_sde_sample(
-    unet_apply: Callable,
+    *,
+    unet_apply: Callable,  # f({"params": p}, x, t_emb, cond) -> (B,H,W,K,C) output (v or eps)
     params,
     shape: Tuple[int, int, int, int, int],  # (B,H,W,K,C)
-    betas: jnp.ndarray,
-    alphas: jnp.ndarray,
-    alpha_bars: jnp.ndarray,
+    betas: jnp.ndarray,  # (T,)
+    alphas: jnp.ndarray,  # (T,)
+    alpha_bars: jnp.ndarray,  # (T,)
     cond_vec: jnp.ndarray,  # (B,D)
-    steps: int = 250,
-    rng=None,
-    v_prediction: bool = True,
-    # --- Classifier-free guidance (CFG) ---
-    cfg_scale: float = 0.0,  # 0 = disabled; typical 1..5
-    null_cond_vec: Optional[jnp.ndarray] = None,  # (B,D) for uncond pass; default zeros
-    cfg_schedule: Literal["linear", "cosine", "exp"] = "cosine",
-    cfg_strength: float = 5.0,  # used only for "exp" schedule
-    # --- Energy guidance ---
-    guidance_fn: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    steps: int,
+    rng: jnp.ndarray,
+    v_prediction: bool,
+    # CFG
+    cfg_scale: float = 0.0,
+    null_cond_vec: Optional[jnp.ndarray] = None,
+    cfg_schedule: str = "cosine",
+    cfg_strength: float = 5.0,
+    # Energy guidance (score-like)
+    guidance_fn: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None,
     guidance_scale: float = 0.0,
-    guidance_schedule: Literal["linear", "cosine", "exp"] = "cosine",
-    guidance_strength: float = 3.0,  # used only for "exp" schedule
-    # --- Mean-field (McKean–Vlasov) ---
-    mf_mode: Literal["none", "voxel", "rbf"] = "rbf",
+    guidance_schedule: str = "cosine",
+    guidance_strength: float = 3.0,
+    # Mean-field coupling
+    mf_mode: Literal["none", "voxel", "rbf"] = "none",
     mf_lambda: float = 0.0,
-    mf_bandwidth: float = 0.5,  # only for "rbf" mode
-    # --- Integration ---
-    prob_flow_ode: bool = False,  # True → deterministic PF-ODE (DDIM-like)
+    mf_bandwidth: float = 0.5,
+    # Dynamics
+    prob_flow_ode: bool = False,  # True → deterministic DDIM (η=0), False → MV-SDE (η>0)
     return_all: bool = False,
-) -> jnp.ndarray:
+) -> jnp.ndarray | Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Reverse-time MV-SDE for VP diffusion with:
-      - Classifier-free guidance (two UNet passes per step when cfg_scale>0)
-      - Energy guidance via ∇_x E(x,cond) (modules+label embedding)
-      - Mean-field interaction term depending on batch empirical law
+    Deterministic DDIM and MV-SDE sampler with mean-field coupling and classifier-free guidance.
 
-    dx = [ -0.5 β x - β sθ(x,t)
-           - w_E(t) * λ_E ∇_x E(x,cond)
-           + F_mf(x; w_MF) ] dt
-         + 1_{not PF-ODE} * sqrt(β) dW
+    Score construction:
+      - If v-pred: eps = c1*x + c0*v, score = -eps/sigma
+      - If eps-pred: eps = model_out, score = -eps/sigma
+      - Mean-field gradient g(x) (local neighbor-based) is added in score space.
+      - Optional energy guidance h(x) = ∇_x(-E) added in score space.
 
-    Scheduling:
-      - CFG weight:   w_CFG(t) ∈ [0,1]
-      - Energy weight w_E(t)   ∈ [0,1]
-      We apply these to (eps_cond, eps_uncond) blending and energy drift respectively.
+    Update (DDIM form):
+      x0 = (x - sigma_t * eps_total) / sqrt(ᾱ_t)
+      σ_ddim = η * sqrt((1-ᾱ_{t-1})/(1-ᾱ_t)) * sqrt(1 - ᾱ_t/ᾱ_{t-1}) * sqrt(1-ᾱ_t)
+      x_{t-1} = sqrt(ᾱ_{t-1}) * x0 + sqrt(1-ᾱ_{t-1} - σ_ddim^2) * eps_total + σ_ddim * z
+
+    Where η=0 → deterministic (prob-flow ODE-ish), η>0 gives SDE-like sampling.
     """
-    T = alpha_bars.shape[0]
-    if rng is None:
-        rng = jax.random.PRNGKey(0)
+    B, H, W, K, C = shape
+    T = int(alpha_bars.shape[0])
 
-    # integer timesteps descending
-    ts_idx = jnp.linspace(T - 1, 0, steps, dtype=jnp.int32)
-    dt = 1.0 / float(steps)
+    # choose η (noise strength)
+    eta = 0.0 if prob_flow_ode else 1.0
 
-    # initial noise
-    rng, kx = jax.random.split(rng)
-    x = jax.random.normal(kx, shape, dtype=jnp.float32)
+    # timestep schedule (descending)
+    ts = _linspace_indices(T, int(steps))
 
-    # default null cond = zeros (unconditional token)
-    if null_cond_vec is None:
-        null_cond_vec = jnp.zeros_like(cond_vec)
+    # handy for time embedding: use raw index; your time_embed handles scaling internally
+    def t_emb_for(idx: int) -> jnp.ndarray:
+        return time_embed_fn(jnp.full((B,), float(idx), dtype=_F32), 128)
+
+    # init x_T ~ N(0,I)
+    rng, k = jax.random.split(rng)
+    x = jax.random.normal(k, shape, dtype=_F32)
 
     traj = []
+    if return_all:
+        traj.append(x)
 
-    for i in range(steps):
-        t_i = ts_idx[i]
-        t_cont = (t_i.astype(jnp.float32) + 0.5) / float(T)  # in (0,1]
-        t_b = jnp.full((shape[0],), t_cont, dtype=jnp.float32)
+    # precompute null conditioning
+    has_null = (
+        (null_cond_vec is not None) and (cfg_scale is not None) and (cfg_scale > 0.0)
+    )
+    if not has_null:
+        null_cond_vec = jnp.zeros_like(cond_vec)
 
-        a_bar = alpha_bars[t_i]
-        beta_t = betas[t_i]
-        a_bar_b = jnp.full((shape[0], 1, 1, 1, 1), a_bar, dtype=jnp.float32)
+    for si in range(int(ts.shape[0])):
+        t_idx = int(ts[si])
+        t_emb = t_emb_for(t_idx)
 
-        # --------- Model prediction → epŝ (with CFG) ---------
-        eps_cond = _eps_hat_from_unet(
-            unet_apply, params, x, t_b, cond_vec, a_bar_b, v_prediction
+        # model evals (conditional & unconditional)
+        out_c = unet_apply({"params": params}, x, t_emb, cond_vec)
+        if cfg_scale > 0.0:
+            out_u = unet_apply({"params": params}, x, t_emb, null_cond_vec)
+            w = jnp.array(cfg_scale, _F32) * _sched_factor(
+                cfg_schedule, t_idx, T, cfg_strength
+            )
+            model_out = out_u + w * (out_c - out_u)
+        else:
+            model_out = out_c
+
+        # map to eps/x0 and build score
+        a_bar_t = alpha_bars[t_idx]
+        eps_pred, x0_pred, sigma_t = _to_eps_from_model(
+            x, model_out, a_bar_t, v_prediction
         )
 
-        if cfg_scale and cfg_scale != 0.0:
-            eps_uncond = _eps_hat_from_unet(
-                unet_apply, params, x, t_b, null_cond_vec, a_bar_b, v_prediction
+        # base score from model
+        score = -eps_pred / jnp.maximum(sigma_t, 1e-8)
+
+        # mean-field coupling (added in score space)
+        if mf_lambda != 0.0 and mf_mode != "none":
+            g = _mean_field_grad(x, mf_mode, mf_bandwidth)
+            score = score + jnp.array(mf_lambda, _F32) * g
+
+        # energy guidance (added in score space)
+        if guidance_fn is not None and guidance_scale > 0.0:
+            sE = jnp.array(guidance_scale, _F32) * _sched_factor(
+                guidance_schedule, t_idx, T, guidance_strength
             )
-            w_cfg = _time_weight(t_b, cfg_schedule, cfg_strength)  # (B,)
-            w_cfg = w_cfg[:, None, None, None, None]
-            eps_hat = eps_uncond + (1.0 + w_cfg * (cfg_scale - 1.0)) * (
-                eps_cond - eps_uncond
-            )
-        else:
-            eps_hat = eps_cond
+            gE = guidance_fn(x)
+            score = score + sE * gE
 
-        # Score
-        score = _score_from_eps(eps_hat, a_bar_b)  # (B,H,W,K,C)
+        # convert final score back to eps for DDIM update
+        eps_total = -jnp.maximum(sigma_t, 1e-8) * score
+        eps_total = _nn(eps_total)
 
-        # Base reverse SDE drift (VP)
-        drift = -0.5 * beta_t * x - beta_t * score
+        # next ᾱ
+        t_prev = int(ts[si + 1]) if (si + 1) < ts.shape[0] else -1
+        a_bar_prev = _abar_at(alpha_bars, t_prev)
 
-        # --------- Energy guidance ---------
-        if guidance_fn is not None and guidance_scale != 0.0:
-            g = guidance_fn(x, t_b)  # ∇_x E
-            w_E = _time_weight(t_b, guidance_schedule, guidance_strength)
-            w_E = w_E[:, None, None, None, None]
-            drift = drift - (w_E * guidance_scale) * g
+        # DDIM stochasticity (η); η=0 → ODE-like
+        sigma_ddim = _ddim_sigma(a_bar_t, a_bar_prev, eta)
+        # deterministic coefficient on eps
+        coeff_eps = jnp.sqrt(jnp.clip(1.0 - a_bar_prev - sigma_ddim**2, 0.0, 1.0))
+        # predicted clean x0 from final eps
+        x0 = (x - jnp.sqrt(jnp.clip(1.0 - a_bar_t, 0.0, 1.0)) * eps_total) / jnp.sqrt(
+            jnp.clip(a_bar_t, 1e-8, 1.0)
+        )
 
-        # --------- Mean-field interaction ---------
-        if mf_mode == "voxel" and mf_lambda > 0.0:
-            drift = drift + _mf_voxel_mean(x, mf_lambda)
-        elif mf_mode == "rbf" and mf_lambda > 0.0:
-            drift = drift + _mf_global_rbf(x, mf_lambda, mf_bandwidth)
+        # noise
+        rng, k = jax.random.split(rng)
+        z = jax.random.normal(k, x.shape, dtype=_F32)
 
-        # --------- Integrate ---------
-        if not prob_flow_ode:
-            rng, kn = jax.random.split(rng)
-            noise = jax.random.normal(kn, x.shape, dtype=x.dtype)
-            x = (
-                x
-                + drift * dt
-                + jnp.sqrt(jnp.clip(beta_t, 1e-8, None)) * jnp.sqrt(dt) * noise
-            )
-        else:
-            x = x + drift * dt
+        # update
+        x = (
+            jnp.sqrt(jnp.clip(a_bar_prev, 0.0, 1.0)) * x0
+            + coeff_eps * eps_total
+            + sigma_ddim * z
+        )
+        x = _nn(x)
 
         if return_all:
             traj.append(x)
 
     if return_all:
-        return jnp.stack(traj, axis=1)  # (B, steps, H, W, K, C)
+        return x, jnp.stack(traj, axis=1)  # (B, S+1, H, W, K, C)
     return x
-
-
-# -------------------------------------------------
-# Legacy deterministic wrapper (DDIM-like)
-# -------------------------------------------------
-def ddim_sample(
-    unet_apply: Callable,
-    params,
-    shape: Tuple[int, int, int, int, int],
-    betas: jnp.ndarray,
-    alphas: jnp.ndarray,
-    alpha_bars: jnp.ndarray,
-    cond_vec: jnp.ndarray,
-    steps: int = 50,
-    rng=None,
-    v_prediction: bool = True,
-    guidance_fn: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
-    guidance_scale: float = 0.0,
-    cfg_scale: float = 0.0,
-    null_cond_vec: Optional[jnp.ndarray] = None,
-    return_all: bool = False,
-) -> jnp.ndarray:
-    """
-    Keeps old call sites alive; routes to MV sampler with prob_flow_ode=True.
-    """
-    return mv_sde_sample(
-        unet_apply=unet_apply,
-        params=params,
-        shape=shape,
-        betas=betas,
-        alphas=alphas,
-        alpha_bars=alpha_bars,
-        cond_vec=cond_vec,
-        steps=steps,
-        rng=rng,
-        v_prediction=v_prediction,
-        cfg_scale=cfg_scale,
-        null_cond_vec=null_cond_vec,
-        guidance_fn=guidance_fn,
-        guidance_scale=guidance_scale,
-        mf_mode="rbf",
-        mf_lambda=0.0,
-        prob_flow_ode=True,
-        return_all=return_all,
-    )
