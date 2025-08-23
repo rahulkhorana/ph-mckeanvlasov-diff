@@ -37,7 +37,13 @@ from dataloader import load_packed_pt
 
 
 # ----------------------- Rendering (H,W,K,C) -> (H,W,3) -----------------------
-def render_rgb(vol: np.ndarray, mode: str = "midk") -> np.ndarray:
+def render_rgb(
+    vol: np.ndarray,
+    mode: str = "midk",
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> np.ndarray:
+    """Render (H,W,K,C) -> uint8 (H,W,3). If vmin/vmax given, use them (global norm)."""
     assert vol.ndim == 4, f"Expected (H,W,K,C), got {vol.shape}"
     H, W, K, C = vol.shape
     v = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -55,17 +61,25 @@ def render_rgb(vol: np.ndarray, mode: str = "midk") -> np.ndarray:
     else:
         raise ValueError(f"Unknown render mode: {mode}")
 
+    # ensure 3 channels
     if img.shape[-1] >= 3:
         img = img[:, :, :3]
     else:
         pad = np.zeros((H, W, 3 - img.shape[-1]), dtype=img.dtype)
         img = np.concatenate([img, pad], axis=-1)
 
-    vmin = np.percentile(img, 1.0)
-    vmax = np.percentile(img, 99.0)
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-        vmin, vmax = float(img.min()), float(img.max()) + 1e-6
-    img01 = np.clip((img - vmin) / (vmax - vmin), 0.0, 1.0)
+    # normalization
+    if (vmin is None) or (vmax is None):
+        lo = np.percentile(img, 1.0)
+        hi = np.percentile(img, 99.0)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(img.min()), float(img.max()) + 1e-6
+    else:
+        lo, hi = float(vmin), float(vmax)
+        if hi <= lo:
+            hi = lo + 1e-6
+
+    img01 = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
     return (img01 * 255.0 + 0.5).astype(np.uint8)
 
 
@@ -296,13 +310,20 @@ def main():
     ap.add_argument("--max_samples", type=int, default=2000)
 
     ap.add_argument(
-        "--pairing", type=str, default="class", choices=["class", "random", "paired"]
+        "--pairing", type=str, default="paired", choices=["class", "random", "paired"]
     )
     ap.add_argument(
         "--render",
         type=str,
         default="midk",
         choices=["avgk", "maxk", "midk"] + [f"slice:k={i}" for i in range(512)],
+    )
+    ap.add_argument(
+        "--render_norm",
+        type=str,
+        default="global",
+        choices=["global", "perimage"],
+        help="Global uses vmin/vmax from real set; perimage uses per-image percentiles.",
     )
     ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
 
@@ -317,6 +338,7 @@ def main():
         choices=["meanrgb", "inception", "none"],
     )
     ap.add_argument("--save_3d", type=int, default=40)
+    ap.add_argument("--save_pairs_grid", action="store_true")
     ap.add_argument("--seed", type=int, default=123)
     args = ap.parse_args()
     rng = np.random.RandomState(args.seed)
@@ -344,6 +366,12 @@ def main():
     if real_labels is not None:
         real_labels = real_labels[:Nr]
 
+    # Global normalization range (robust) from real set
+    g_lo = float(np.percentile(real_vol, 1.0))
+    g_hi = float(np.percentile(real_vol, 99.0))
+    if not np.isfinite(g_lo) or not np.isfinite(g_hi) or g_hi <= g_lo:
+        g_lo, g_hi = float(real_vol.min()), float(real_vol.max()) + 1e-6
+
     # -------- Generated data (.npz or .npy) --------
     gen_files = sorted(glob(args.gen_glob))
     if len(gen_files) == 0:
@@ -367,6 +395,7 @@ def main():
             if arr.ndim != 5:
                 raise ValueError(f"Expected (B,H,W,K,C) in {f}, got {arr.shape}")
             gens.append(arr)
+
     gen_vol = np.concatenate(gens, axis=0)
     Nf_full = gen_vol.shape[0]
     Nf = min(args.max_samples, Nf_full)
@@ -375,8 +404,13 @@ def main():
         gen_labels = np.asarray(gen_labels)[:Nf]
 
     # -------- Render to RGB --------
-    real_imgs = [to_pil(render_rgb(v, args.render)) for v in real_vol]
-    fake_imgs = [to_pil(render_rgb(v, args.render)) for v in gen_vol]
+    if args.render_norm == "global":
+        real_imgs = [to_pil(render_rgb(v, args.render, g_lo, g_hi)) for v in real_vol]
+        fake_imgs = [to_pil(render_rgb(v, args.render, g_lo, g_hi)) for v in gen_vol]
+    else:
+        real_imgs = [to_pil(render_rgb(v, args.render)) for v in real_vol]
+        fake_imgs = [to_pil(render_rgb(v, args.render)) for v in gen_vol]
+
     grid_image(real_imgs[:64], nrow=8).save(outdir / "figs/real_grid.png")
     grid_image(fake_imgs[:64], nrow=8).save(outdir / "figs/fake_grid.png")
 
@@ -390,7 +424,7 @@ def main():
 
     # -------- Labels for pairing --------
     fake_labels = None
-    pseudo_mode = None
+    pseudo_mode: Optional[str] = None
     if args.pairing == "class":
         if real_labels is None and gen_labels is None:
             print("[warn] no labels; falling back to random.")
@@ -457,6 +491,10 @@ def main():
         m = min(len(real_imgs), len(fake_imgs))
         pairs = [(i, i) for i in range(m)]
     elif args.pairing == "random" or (args.pairing == "class" and fake_labels is None):
+        if args.pairing == "class" and fake_labels is None:
+            print(
+                "[warn] pseudo-labels not available; using random pairing for PSNR/SSIM."
+            )
         pairs = choose_pairs_random(len(real_imgs), len(fake_imgs))
     else:
         gr = group_indices(real_labels)  # type: ignore
@@ -469,12 +507,24 @@ def main():
             }
             for c in all_keys
         }
-        (outdir / "diagnostics").mkdir(exist_ok=True, parents=True)
         with open(outdir / "diagnostics/confusion_counts.json", "w") as f:
             json.dump(conf, f, indent=2)
         pairs = []
         for c in sorted(set(gr.keys()) & set(gf.keys())):
             pairs += pairs_within_class(gr[c], gf[c], args.limit_per_class, rng_np)
+
+    # Optional: save a grid of paired comparisons
+    if args.save_pairs_grid and len(pairs) > 0:
+        tiles = []
+        for ir, jf in pairs[:64]:
+            A = real_imgs[ir].copy()
+            B = fake_imgs[jf].copy()
+            w, h = A.size
+            canv = Image.new("RGB", (w * 2 + 4, h), (255, 255, 255))
+            canv.paste(A, (0, 0))
+            canv.paste(B, (w + 4, 0))
+            tiles.append(canv)
+        grid_image(tiles, nrow=8).save(outdir / "figs/pairs_grid.png")
 
     # -------- PSNR/SSIM + 3D PSNR --------
     vmin = float(np.percentile(real_vol, 0.1))
@@ -503,12 +553,14 @@ def main():
         plt.savefig(outdir / "figs/ssim_hist.png")
         plt.close()
 
+    # -------- 3D viridis snapshots --------
     n3d = max(0, int(args.save_3d))
     for i in range(min(n3d, len(real_vol))):
         save_3x3_surface_grid(real_vol[i], outdir / f"figs/real_{i:03d}.png", "real")
     for i in range(min(n3d, len(gen_vol))):
         save_3x3_surface_grid(gen_vol[i], outdir / f"figs/fake_{i:03d}.png", "fake")
 
+    # -------- Write metrics --------
     def _nanmean(x):
         return float(np.nanmean(x)) if len(x) else float("nan")
 
@@ -522,6 +574,7 @@ def main():
             "pairs": int(len(pairs)),
         },
         "render_mode": args.render,
+        "render_norm": args.render_norm,
         "pairing": args.pairing,
         "limit_per_class": int(args.limit_per_class),
         "PSNR_mean": _nanmean(psnrs),
@@ -530,13 +583,9 @@ def main():
         "PSNR_3D_std": _nanstd(psnrs3d),
         "SSIM_mean": float(np.nanmean(ssims)) if ssims else float("nan"),
         "SSIM_std": float(np.nanstd(ssims)) if ssims else float("nan"),
-        "global_FID": (
-            None
-            if (fr := fid_from_feats(feats_real, feats_fake)) is None
-            else float(fr)
-        ),
-        "global_KID_mean": None,
-        "global_KID_std": None,
+        "global_FID": None if global_FID is None else float(global_FID),
+        "global_KID_mean": None if global_KID_mean is None else float(global_KID_mean),
+        "global_KID_std": None if global_KID_std is None else float(global_KID_std),
         "per_class": {},
         "notes": {
             "real_pt": args.real_pt,
@@ -545,23 +594,16 @@ def main():
             "min_fid_n": int(args.min_fid_n),
             "has_gen_labels": bool(gen_labels is not None),
             "pseudo_label": (
-                "provided"
-                if gen_labels is not None
-                else (args.pseudo_label if args.pairing == "class" else "n/a")
+                pseudo_mode
+                if pseudo_mode is not None
+                else (
+                    "provided"
+                    if gen_labels is not None
+                    else (args.pseudo_label if args.pairing == "class" else "n/a")
+                )
             ),
         },
     }
-    # KID (optional & guarded)
-    if min(feats_real.shape[0], feats_fake.shape[0]) >= args.min_fid_n:
-        km, ks = kid_from_feats(
-            feats_real,
-            feats_fake,
-            num_subsets=10,
-            subset_size=1000,
-            rng=np.random.RandomState(args.seed),
-        )
-        metrics["global_KID_mean"] = None if km is None else float(km)
-        metrics["global_KID_std"] = None if ks is None else float(ks)
 
     with open(outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
