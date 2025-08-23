@@ -316,7 +316,7 @@ def main():
         default="inception",
         choices=["meanrgb", "inception", "none"],
     )
-    ap.add_argument("--save_3d", type=int, default=8)
+    ap.add_argument("--save_3d", type=int, default=40)
     ap.add_argument("--seed", type=int, default=123)
     args = ap.parse_args()
     rng = np.random.RandomState(args.seed)

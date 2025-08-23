@@ -1,0 +1,45 @@
+{
+  "seed": 0,
+  "sampler": "mv_sde",
+  "sample_steps": 400,
+  "sample_count": 128,
+  "cfg_scale": 3.0,
+  "mf": {
+    "mode": "rbf",
+    "lambda": 0.05,
+    "bandwidth": 0.6
+  },
+  "train": {
+    "steps": 2000,
+    "lr": 0.0002,
+    "T": 1000,
+    "schedule": "cosine",
+    "ema_decay": 0.999,
+    "cfg_drop": 0.1
+  },
+  "data": {
+    "H": 128,
+    "W": 128,
+    "K": 3,
+    "C": 3,
+    "num_classes": 8,
+    "data_pt": "/content/drive/MyDrive/ph-mckeanvlasov-diff/datasets/unified_topological_data_v6_semifast.pt"
+  },
+  "norm": {
+    "lo": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "hi": [
+      0.9685039520263672,
+      0.6613494157791138,
+      0.0
+    ],
+    "type": "pct",
+    "p": [
+      1.0,
+      99.0
+    ]
+  }
+}
