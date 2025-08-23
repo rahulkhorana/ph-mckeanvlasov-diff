@@ -1,26 +1,9 @@
 # sampling.py
-import jax
-import jax.numpy as jnp
-from typing import Callable, Optional, Tuple
+import jax, jax.numpy as jnp
+from typing import Optional, Literal
+from models import time_embed
 
 
-# ---------------------------
-# Time embedding (used here)
-# ---------------------------
-def time_embed(t_cont: jnp.ndarray, dim: int = 128) -> jnp.ndarray:
-    """Sinusoidal embedding for continuous t in [0,1]."""
-    half = dim // 2
-    freqs = jnp.exp(jnp.linspace(0.0, jnp.log(10000.0), half, dtype=jnp.float32))
-    ang = t_cont[:, None] * freqs[None, :]
-    emb = jnp.concatenate([jnp.sin(ang), jnp.cos(ang)], axis=-1)
-    if dim % 2 == 1:
-        emb = jnp.pad(emb, ((0, 0), (0, 1)))
-    return emb.astype(jnp.float32)
-
-
-# ---------------------------
-# Energy bridge (module-wise)
-# ---------------------------
 def make_module_bridge(E_apply, eparams, cond_vec, T: int):
     """
     cond_vec is *fixed* for sampling (B, cond_dim).
@@ -34,151 +17,141 @@ def make_module_bridge(E_apply, eparams, cond_vec, T: int):
     grad_fn = jax.grad(energy_mean)
 
     def bridge_fn(x_t, t_cont, x0_hat):
-        # We only use the gradient w.r.t. x0_hat (guidance towards lower energy)
         return grad_fn(x0_hat)
 
     return bridge_fn
 
 
-# ---------------------------
-# Helper: combine CFG
-# ---------------------------
-def _cfg_merge(
-    pred_uncond: jnp.ndarray, pred_cond: jnp.ndarray, scale: float
-) -> jnp.ndarray:
-    # pred = u + s*(c - u)  (classifier-free guidance)
-    return pred_uncond + scale * (pred_cond - pred_uncond)
+# ------------------------------ helpers ------------------------------
 
 
-# ---------------------------
-# Helper: convert head -> eps
-# ---------------------------
-def _to_eps_from_pred(
-    pred: jnp.ndarray,
-    x_t: jnp.ndarray,
-    sqrt_ab_t: jnp.ndarray,
-    sqrt_one_ab_t: jnp.ndarray,
-    v_prediction: bool,
-) -> jnp.ndarray:
+def _time_embed_from_index(t_idx: jnp.ndarray, T: int, dim: int = 128) -> jnp.ndarray:
+    # t_idx: (B,) int32 in [0, T-1]
+    t_cont = (t_idx.astype(jnp.float32) + 0.5) / float(T)
+    return time_embed(t_cont, dim=dim)
+
+
+def _predict_eps(
+    unet_apply, params, x, a_bar_t, t_idx, T, cond_vec, v_prediction: bool
+):
     """
-    Given UNet output 'pred' as either epsilon or v, return epsilon.
+    Returns ε̂ at time t given model output head type.
     """
+    temb = _time_embed_from_index(jnp.full((x.shape[0],), t_idx, dtype=jnp.int32), T)
+    pred = unet_apply({"params": params}, x, temb, cond_vec)  # ε̂ or v̂ depending on head
     if v_prediction:
-        # v = (sqrt(a) * eps - sqrt(1-a) * x)  (one common definition)
-        # -> eps = (v + sqrt(1-a) * x) / sqrt(a)
-        # But we follow the stable variant used in code before:
-        # eps = sqrt(a)*pred + sqrt(1-a)*x
-        return sqrt_ab_t * pred + sqrt_one_ab_t * x_t
+        sqrt_ab = jnp.sqrt(a_bar_t)
+        sqrt_1ab = jnp.sqrt(1.0 - a_bar_t)
+        eps_hat = sqrt_ab * pred + sqrt_1ab * x
     else:
-        return pred
+        eps_hat = pred
+    return eps_hat  # (B,H,W,K,C)
 
 
-# ---------------------------
-# Helper: score from eps
-# ---------------------------
-def _score_from_eps(eps: jnp.ndarray, sigma_t: jnp.ndarray) -> jnp.ndarray:
-    # ∇_x log p_t(x) ∝ - eps / sigma_t
-    sigma_t = jnp.maximum(sigma_t, 1e-8)
-    return -eps / sigma_t
-
-
-# ---------------------------
-# Mean-field coupling (local)
-# ---------------------------
-def _gaussian_kernel_3d(ks: int, sigma: float) -> jnp.ndarray:
-    """(ks,ks,ks) normalized Gaussian kernel."""
-    ax = jnp.arange(ks, dtype=jnp.float32) - (ks - 1) / 2.0
-    g1 = jnp.exp(-(ax**2) / (2 * sigma * sigma))
-    g1 = g1 / jnp.maximum(jnp.sum(g1), 1e-8)
-    K = (g1[:, None, None] * g1[None, :, None] * g1[None, None, :]).astype(jnp.float32)
-    K = K / jnp.maximum(jnp.sum(K), 1e-8)
-    return K
-
-
-def _depthwise_conv3d_same(
-    x: jnp.ndarray, kernel: jnp.ndarray  # (B,H,W,K,C)  # (kh,kw,kk)
-) -> jnp.ndarray:
-    """Depthwise 3D conv per-channel, SAME padding, stride 1."""
-    B, H, W, K, C = x.shape
-    ker = kernel[:, :, :, None, None]  # (kh,kw,kk,1,1)
-
-    def conv_one_channel(xc: jnp.ndarray) -> jnp.ndarray:
-        # xc: (B,H,W,K) -> (B,H,W,K)
-        xc = xc[..., None]  # (B,H,W,K,1)
-        y = jax.lax.conv_general_dilated(
-            xc,
-            ker,
-            window_strides=(1, 1, 1),
-            padding="SAME",
-            dimension_numbers=("NHWDC", "DHWIO", "NHWDC"),
-        )
-        return jnp.squeeze(y, axis=-1)
-
-    # vmaps over channel
-    x_c_first = jnp.moveaxis(x, -1, 0)  # (C,B,H,W,K)
-    y_c = jax.vmap(conv_one_channel)(x_c_first)  # (C,B,H,W,K)
-    y = jnp.moveaxis(y_c, 0, -1)  # (B,H,W,K,C)
-    return y
-
-
-def mean_field_force(
-    x_t: jnp.ndarray,
-    mode: str = "rbf",
-    bandwidth: float = 0.5,
-    kernel_size: int = 3,
-    strength: float = 1.0,
-) -> jnp.ndarray:
-    """
-    Compute a cheap per-batch mean-field force F[x_t].
-    - 'rbf'   : local Gaussian smoothing, F = (Gσ * x) - x
-    - 'voxel' : small uniform box avg,     F = Avg3x3x3(x) - x
-    """
-    if strength == 0.0:
-        return jnp.zeros_like(x_t)
-
-    if mode == "rbf":
-        sigma = jnp.maximum(bandwidth, 1e-4)
-        ks = int(max(3, kernel_size | 1))  # odd >=3
-        ker = _gaussian_kernel_3d(ks, float(sigma))
-        sm = _depthwise_conv3d_same(x_t, ker)
-        return strength * (sm - x_t)
-
-    elif mode == "voxel":
-        ks = int(max(3, kernel_size | 1))
-        ker = jnp.ones((ks, ks, ks), dtype=jnp.float32)
-        ker = ker / jnp.maximum(jnp.sum(ker), 1e-8)
-        sm = _depthwise_conv3d_same(x_t, ker)
-        return strength * (sm - x_t)
-
-    else:
-        return jnp.zeros_like(x_t)
-
-
-# ---------------------------
-# DDIM sampler (η = 0)
-# ---------------------------
-def ddim_sample(
-    unet_apply: Callable,
+def _cfg_blend(
+    unet_apply,
     params,
-    shape: Tuple[int, int, int, int, int],
-    betas: jnp.ndarray,
-    alphas: jnp.ndarray,
-    alpha_bars: jnp.ndarray,
-    cond_vec: jnp.ndarray,  # (B, D), fixed during sampling
+    x,
+    a_bar_t,
+    t_idx,
+    T,
+    cond_vec,
+    cond_uncond_vec,
+    v_prediction: bool,
+    cfg_scale: float,
+):
+    """
+    Classifier-free guidance on ε̂. If cond_uncond_vec is None or cfg_scale==0, returns conditional only.
+    """
+    eps_c = _predict_eps(
+        unet_apply, params, x, a_bar_t, t_idx, T, cond_vec, v_prediction
+    )
+    if (cond_uncond_vec is None) or (cfg_scale == 0.0):
+        return eps_c
+    eps_u = _predict_eps(
+        unet_apply, params, x, a_bar_t, t_idx, T, cond_uncond_vec, v_prediction
+    )
+    return eps_u + cfg_scale * (eps_c - eps_u)
+
+
+def _x0_from_xt_eps(x, a_bar_t, eps_hat):
+    sqrt_ab = jnp.sqrt(a_bar_t)
+    sqrt_1ab = jnp.sqrt(1.0 - a_bar_t)
+    return (x - sqrt_1ab * eps_hat) / jnp.clip(sqrt_ab, 1e-8)
+
+
+def _mf_voxel_drift(x0_hat, kernel_size: int = 3) -> jnp.ndarray:
+    """
+    Local mean-field: drift toward blurred field ~ x0_hat - blur(x0_hat).
+    Uses box blur via depthwise conv (uniform kernel).
+    """
+    assert kernel_size % 2 == 1, "kernel must be odd"
+    B, H, W, K, C = x0_hat.shape
+    k = kernel_size
+    # Depthwise 3D box filter per-channel.
+    filt = jnp.ones((k, k, k), dtype=x0_hat.dtype) / float(k * k * k)
+    filt = filt[:, :, :, None, None]  # (k,k,k,1,1) depthwise
+    # Reshape to (B,H,W,K,C) -> NHCWC (same)
+    y = jax.lax.conv_general_dilated(
+        x0_hat,
+        filt,
+        window_strides=(1, 1, 1),
+        padding=[(k // 2, k // 2)] * 3,
+        dimension_numbers=("NHWDC", "DHWIO", "NHWDC"),
+        feature_group_count=C,  # depthwise per-channel
+    )
+    return x0_hat - y  # push away from local mean
+
+
+def _mf_rbf_drift(x0_hat, bandwidth: float = 0.5) -> jnp.ndarray:
+    """
+    Batch mean-field: for each sample i, drift toward kernel-weighted batch mean.
+    Embedding = global mean per sample (simple, light).
+    """
+    B = x0_hat.shape[0]
+    feat = jnp.mean(x0_hat, axis=(1, 2, 3, 4))  # (B,) simple scalar (one per sample)
+    feat = feat[:, None]  # (B,1)
+    # pairwise squared distances
+    diff = feat - feat.T  # (B,B,1)
+    d2 = jnp.sum(diff * diff, axis=-1)  # (B,B)
+    s2 = jnp.maximum(bandwidth * bandwidth, 1e-6)
+    Kmat = jnp.exp(-d2 / (2.0 * s2))  # (B,B)
+    # normalize rows
+    Z = jnp.clip(jnp.sum(Kmat, axis=1, keepdims=True), 1e-6)
+    W = Kmat / Z  # (B,B)
+    # weighted batch mean in data space
+    xm = jnp.tensordot(W, x0_hat, axes=(1, 0))  # (B,H,W,K,C)
+    return (
+        x0_hat - xm
+    )  # pull toward / away from batch mean (repulsive if subtracted from eps)
+
+
+# ------------------------------ samplers ------------------------------
+
+
+def ddim_sample(
+    unet_apply,
+    params,
+    shape,
+    betas,
+    alphas,
+    alpha_bars,
+    cond_vec,  # (B,cond_dim), fixed during sampling
     steps: int = 50,
-    rng: Optional[jax.Array] = None,
+    rng=None,
     v_prediction: bool = True,
-    bridge_fn: Optional[Callable] = None,  # bridge(x_t, t_cont, x0_hat) -> grad wrt x0
-    bridge_scale: float = 1.0,
-    cfg_scale: float = 0.0,
-    cond_uncond_vec: Optional[jnp.ndarray] = None,  # (B, D) for CFG
+    bridge_fn=None,
+    bridge_scale: float = 0.0,  # energy bridge on x0_hat
+    cfg_scale: float = 0.0,  # CFG
+    cond_uncond_vec: Optional[jnp.ndarray] = None,
     return_all: bool = False,
 ):
     """
-    Deterministic DDIM (η=0) with optional module-bridge (energy on x0_hat) and CFG.
+    Deterministic DDIM (η=0) with optional CFG and energy bridge.
     """
     T = alpha_bars.shape[0]
     ts = jnp.linspace(T - 1, 1, steps).round().astype(jnp.int32)
+
     key = jax.random.PRNGKey(0) if rng is None else rng
     x = jax.random.normal(key, shape)
     traj = []
@@ -186,32 +159,32 @@ def ddim_sample(
     for t in ts:
         a_t = alpha_bars[t]
         a_tm1 = alpha_bars[jnp.maximum(t - 1, 0)]
-        sqrt_ab = jnp.sqrt(a_t)
-        sqrt_1ab = jnp.sqrt(1.0 - a_t)
-        t_cont = (t.astype(jnp.float32) + 0.5) / float(T)
-        temb = time_embed(jnp.full((shape[0],), t_cont, dtype=jnp.float32), dim=128)
 
-        # Predict (eps or v) with conditional (and optional unconditional for CFG)
-        pred_c = unet_apply({"params": params}, x, temb, cond_vec)  # (B,....,C)
-        if cfg_scale != 0.0 and cond_uncond_vec is not None:
-            pred_u = unet_apply({"params": params}, x, temb, cond_uncond_vec)
-            pred = _cfg_merge(pred_u, pred_c, float(cfg_scale))
-        else:
-            pred = pred_c
+        # ε̂ via (optionally) CFG
+        eps_hat = _cfg_blend(
+            unet_apply,
+            params,
+            x,
+            a_t,
+            int(t),
+            T,
+            cond_vec,
+            cond_uncond_vec,
+            v_prediction,
+            float(cfg_scale),
+        )
 
-        # Convert to epsilon
-        eps = _to_eps_from_pred(pred, x, sqrt_ab, sqrt_1ab, v_prediction)
+        # energy bridge at x0_hat
+        x0_hat = _x0_from_xt_eps(x, a_t, eps_hat)
+        if (bridge_fn is not None) and (bridge_scale != 0.0):
+            g_b = bridge_fn(x, (float(t) + 0.5) / float(T), x0_hat)
+            # weight larger near data (same schedule you had)
+            w_t = jnp.sqrt(jnp.maximum(1.0 - a_t, 0.0))
+            eps_hat = eps_hat - float(bridge_scale) * w_t * g_b
 
-        # Bridge on x0_hat
-        x0_hat = (x - sqrt_1ab * eps) / jnp.maximum(sqrt_ab, 1e-8)
-        if bridge_fn is not None and bridge_scale != 0.0:
-            g_b = bridge_fn(x, t_cont, x0_hat)
-            w_t = jnp.sqrt(jnp.maximum(1.0 - a_t, 0.0))  # stronger near noise
-            eps = eps - bridge_scale * w_t * g_b
-
-        # DDIM update (η=0)
-        x0_hat = (x - sqrt_1ab * eps) / jnp.maximum(sqrt_ab, 1e-8)
-        x = jnp.sqrt(jnp.maximum(a_tm1, 0.0)) * x0_hat
+        # update (DDIM, η=0)
+        x0_hat = _x0_from_xt_eps(x, a_t, eps_hat)
+        x = jnp.sqrt(a_tm1) * x0_hat
 
         if return_all:
             traj.append(x)
@@ -219,46 +192,37 @@ def ddim_sample(
     return jnp.stack(traj, 1) if return_all else x
 
 
-# ---------------------------
-# MV-SDE sampler
-# ---------------------------
 def mv_sde_sample(
-    unet_apply: Callable,
+    unet_apply,
     params,
-    shape: Tuple[int, int, int, int, int],
-    betas: jnp.ndarray,  # (T,)
-    alphas: jnp.ndarray,  # (T,)
-    alpha_bars: jnp.ndarray,  # (T,)
-    cond_vec: jnp.ndarray,  # (B,D)
+    shape,
+    betas,
+    alphas,
+    alpha_bars,
+    cond_vec,  # (B,cond_dim)
     steps: int = 50,
-    rng: Optional[jax.Array] = None,
+    rng=None,
     v_prediction: bool = True,
-    # mean-field
-    mf_mode: str = "rbf",
-    mf_lambda: float = 0.05,
+    mf_mode: Literal["none", "rbf", "voxel"] = "none",
+    mf_lambda: float = 0.0,
     mf_bandwidth: float = 0.5,
     mf_kernel_size: int = 3,
-    # energy bridge on x0_hat
-    bridge_fn: Optional[Callable] = None,
-    bridge_scale: float = 1.0,
-    # classifier-free guidance
+    bridge_fn=None,
+    bridge_scale: float = 0.0,
     cfg_scale: float = 0.0,
     cond_uncond_vec: Optional[jnp.ndarray] = None,
-    # ODE vs SDE
-    prob_flow_ode: bool = True,
-    # noise scale for SDE branch (relative to DDPM variance)
-    sde_eta: float = 1.0,
+    prob_flow_ode: bool = True,  # True = deterministic (DDIM-like), False = stochastic
     return_all: bool = False,
 ):
     """
-    McKean–Vlasov SDE sampler with mean-field coupling and optional prob-flow ODE.
-    Drift = DDPM/DDIM drift + mf_lambda * F[x_t].
-
-    - If prob_flow_ode=True: integrates the probability-flow ODE (deterministic), equivalent to DDIM(η=0) + MF/bridge.
-    - Else: Euler–Maruyama with diffusion term scaled by `sde_eta`.
+    MV-SDE with optional mean-field coupling + CFG + energy bridge.
+    - prob_flow_ode=True: deterministic probability-flow ODE (like DDIM η=0).
+    - prob_flow_ode=False: stochastic SDE (adds noise).
+    Mean-field is applied in x0_hat space and reflected back onto ε̂.
     """
     T = alpha_bars.shape[0]
     ts = jnp.linspace(T - 1, 1, steps).round().astype(jnp.int32)
+
     key = jax.random.PRNGKey(0) if rng is None else rng
     x = jax.random.normal(key, shape)
     traj = []
@@ -266,61 +230,66 @@ def mv_sde_sample(
     for t in ts:
         a_t = alpha_bars[t]
         a_tm1 = alpha_bars[jnp.maximum(t - 1, 0)]
-        sqrt_ab = jnp.sqrt(a_t)
-        sqrt_1ab = jnp.sqrt(1.0 - a_t)
-        sigma_t = sqrt_1ab
+        sqrt_1ab = jnp.sqrt(jnp.maximum(1.0 - a_t, 0.0))
 
-        t_cont = (t.astype(jnp.float32) + 0.5) / float(T)
-        temb = time_embed(jnp.full((shape[0],), t_cont, dtype=jnp.float32), dim=128)
-
-        # UNet predictions
-        pred_c = unet_apply({"params": params}, x, temb, cond_vec)
-        if cfg_scale != 0.0 and cond_uncond_vec is not None:
-            pred_u = unet_apply({"params": params}, x, temb, cond_uncond_vec)
-            pred = _cfg_merge(pred_u, pred_c, float(cfg_scale))
-        else:
-            pred = pred_c
-
-        # epsilon + score
-        eps = _to_eps_from_pred(pred, x, sqrt_ab, sqrt_1ab, v_prediction)
-        score = _score_from_eps(eps, sigma_t)  # shape like x
-
-        # Mean-field force at x_t
-        F_mf = mean_field_force(
+        # ε̂ (CFG)
+        eps_hat = _cfg_blend(
+            unet_apply,
+            params,
             x,
-            mode=mf_mode,
-            bandwidth=mf_bandwidth,
-            kernel_size=mf_kernel_size,
-            strength=1.0,
+            a_t,
+            int(t),
+            T,
+            cond_vec,
+            cond_uncond_vec,
+            v_prediction,
+            float(cfg_scale),
         )
-        # Optional energy bridge on x0_hat (acts through eps correction)
-        if bridge_fn is not None and bridge_scale != 0.0:
-            x0_hat = (x - sqrt_1ab * eps) / jnp.maximum(sqrt_ab, 1e-8)
-            g_b = bridge_fn(x, t_cont, x0_hat)
-            w_t = jnp.sqrt(jnp.maximum(1.0 - a_t, 0.0))
-            eps = eps - bridge_scale * w_t * g_b
-            score = _score_from_eps(eps, sigma_t)
 
+        # x0_hat
+        x0_hat = _x0_from_xt_eps(x, a_t, eps_hat)
+
+        # energy bridge (on x0_hat)
+        if (bridge_fn is not None) and (bridge_scale != 0.0):
+            g_b = bridge_fn(x, (float(t) + 0.5) / float(T), x0_hat)
+            w_t = sqrt_1ab
+            eps_hat = eps_hat - float(bridge_scale) * w_t * g_b
+            x0_hat = _x0_from_xt_eps(x, a_t, eps_hat)  # refresh
+
+        # mean-field coupling (reflected on ε̂)
+        if (mf_mode != "none") and (mf_lambda != 0.0):
+            if mf_mode == "voxel":
+                drift = _mf_voxel_drift(x0_hat, kernel_size=int(mf_kernel_size))
+            elif mf_mode == "rbf":
+                drift = _mf_rbf_drift(x0_hat, bandwidth=float(mf_bandwidth))
+            else:
+                drift = 0.0
+            # map drift in x0 space to ε̂ perturbation:
+            # x0_hat = (x - sqrt(1-a_t) ε̂)/sqrt(a_t)  =>  ε̂ = (x - sqrt(a_t) x0_hat)/sqrt(1-a_t)
+            # small change Δx0 induces Δε̂ ≈ -sqrt(a_t)/sqrt(1-a_t) * Δx0
+            scale = -jnp.sqrt(jnp.maximum(a_t, 1e-8)) / jnp.clip(sqrt_1ab, 1e-8)
+            eps_hat = eps_hat + float(mf_lambda) * scale * drift
+            x0_hat = _x0_from_xt_eps(x, a_t, eps_hat)  # refresh
+
+        # step
         if prob_flow_ode:
-            # Probability-flow ODE update ≈ DDIM(η=0), add MF drift in x-space.
-            x0_hat = (x - sqrt_1ab * eps) / jnp.maximum(sqrt_ab, 1e-8)
-            x_det = jnp.sqrt(jnp.maximum(a_tm1, 0.0)) * x0_hat
-            # Small MF push (discrete surrogate of ∫ λ F[x_t] dt across step)
-            # Weight by w_t so it fades as we approach t=0
-            w_t = jnp.sqrt(jnp.maximum(1.0 - a_t, 0.0))
-            x = x_det + mf_lambda * w_t * F_mf
+            # deterministic flow (DDIM-like, η=0)
+            x = jnp.sqrt(a_tm1) * x0_hat
         else:
-            # Euler–Maruyama step for reverse-time SDE
-            # Reverse SDE drift ~ -0.5*beta_t*x_t - beta_t * score
-            beta_t = 1.0 - alphas[t]
-            drift = -0.5 * beta_t * x - beta_t * score + mf_lambda * F_mf
-            # Δt per step across [0,1]: simple uniform partition
-            dt = 1.0 / float(steps)
-            # diffusion term magnitude ~ sqrt(beta_t) (variance-preserving SDE)
-            g_t = jnp.sqrt(jnp.maximum(beta_t, 1e-8))
-            key, sub = jax.random.split(key)
-            z = jax.random.normal(sub, shape)
-            x = x + drift * dt + sde_eta * g_t * jnp.sqrt(dt) * z
+            # stochastic DDPM-like step
+            key, key_n = jax.random.split(key)
+            beta_t = betas[t]
+            # variance preserving step (one of many valid discretizations)
+            sigma_t = jnp.sqrt(jnp.maximum(beta_t, 1e-8))
+            mean_xtm1 = (
+                jnp.sqrt(a_tm1) * x0_hat
+                + jnp.sqrt(jnp.maximum(1.0 - a_tm1 - (1.0 - a_t), 0.0)) * eps_hat * 0.0
+            )
+            # Above "mean_xtm1" uses classic DDIM mean; you can also use VP-DDPM mean:
+            # mean = sqrt(α_t) * x - ( (1-α_t) / sqrt(1-ᾱ_t) ) * ε̂
+            # but DDIM-style keeps consistency with prob_flow branch.
+            noise = jax.random.normal(key_n, shape)
+            x = mean_xtm1 + sigma_t * noise
 
         if return_all:
             traj.append(x)

@@ -60,7 +60,7 @@ def main():
 
     # ---- sampling ----
     ap.add_argument("--sampler", type=str, default="mv_sde", choices=["ddim", "mv_sde"])
-    ap.add_argument("--sample_steps", type=int, default=200)
+    ap.add_argument("--sample_steps", type=int, default=500)
     ap.add_argument(
         "--cfg_scale", type=float, default=0.0, help="CFG scale at sample time"
     )
@@ -185,7 +185,7 @@ def main():
 
         if step % 20 == 0 or step == 1 or step == args.steps:
             print(
-                f"step {step:05d} | ddpm_loss={float(dloss):.5f}"
+                f"step {step:05d} | diff_loss={float(dloss):.5f}"
                 + (f" | energy_loss={float(eloss):.5f}" if args.use_energy else "")
             )
 

@@ -64,14 +64,40 @@ class PackedDataset:
 
 
 def train_val_split(
-    pack: Dict[str, Any], val_frac: float = 0.1, seed: int = 0
+    pack: Dict[str, Any],
+    val_frac: float = 0.1,
+    seed: int = 0,
+    ensure_min_per_class: int = 1,
 ) -> Tuple[PackedDataset, PackedDataset]:
-    N = pack["vol"].shape[0]
-    rng = np.random.RandomState(seed)
-    idx = np.arange(N)
-    rng.shuffle(idx)
-    n_val = int(round(val_frac * N))
-    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+
+    vol = pack["vol"]
+    labels = pack["labels"]
+    modules = pack["modules"]
+
+    N = vol.shape[0]
+    assert len(labels) == N and len(modules) == N, "mismatched lengths in pack"
+
+    rng = np.random.default_rng(seed)
+    classes = np.unique(labels)
+
+    train_idx, val_idx = [], []
+    for c in classes:
+        idx_c = np.where(labels == c)[0]
+        rng.shuffle(idx_c)
+        # how many for val from this class
+        n_val_c = int(round(len(idx_c) * val_frac))
+        if ensure_min_per_class > 0:
+            n_val_c = max(n_val_c, min(ensure_min_per_class, len(idx_c)))
+        # avoid empty train slice for tiny classes
+        if n_val_c >= len(idx_c) and len(idx_c) > 1:
+            n_val_c = len(idx_c) - 1
+        val_idx.append(idx_c[:n_val_c])
+        train_idx.append(idx_c[n_val_c:])
+
+    val_idx = np.concatenate(val_idx) if len(val_idx) else np.array([], dtype=int)
+    tr_idx = np.concatenate(train_idx) if len(train_idx) else np.array([], dtype=int)
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
 
     def subset(ii):
         return PackedDataset(
