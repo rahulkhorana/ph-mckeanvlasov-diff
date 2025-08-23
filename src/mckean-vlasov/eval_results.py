@@ -1,4 +1,4 @@
-# eval_results.py — robust .npz/.npy load, sane FID for small N, 3D PSNR & 3D plots
+# eval_results.py — robust eval with explicit normalization, guarded FID/KID, pairs save, 3D plots
 import argparse, json, math
 from pathlib import Path
 from glob import glob
@@ -36,14 +36,9 @@ except Exception:
 from dataloader import load_packed_pt
 
 
-# ----------------------- Rendering (H,W,K,C) -> (H,W,3) -----------------------
-def render_rgb(
-    vol: np.ndarray,
-    mode: str = "midk",
-    vmin: float | None = None,
-    vmax: float | None = None,
-) -> np.ndarray:
-    """Render (H,W,K,C) -> uint8 (H,W,3). If vmin/vmax given, use them (global norm)."""
+# ----------------------- Rendering helpers -----------------------
+def _select_image_from_vol(vol: np.ndarray, mode: str) -> np.ndarray:
+    """Return float32 (H,W,C) BEFORE any scaling; handles channel padding."""
     assert vol.ndim == 4, f"Expected (H,W,K,C), got {vol.shape}"
     H, W, K, C = vol.shape
     v = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -67,20 +62,78 @@ def render_rgb(
     else:
         pad = np.zeros((H, W, 3 - img.shape[-1]), dtype=img.dtype)
         img = np.concatenate([img, pad], axis=-1)
+    return img.astype(np.float32)
 
-    # normalization
-    if (vmin is None) or (vmax is None):
-        lo = np.percentile(img, 1.0)
-        hi = np.percentile(img, 99.0)
+
+def render_rgb(
+    vol: np.ndarray,
+    mode: str = "midk",
+    norm: str = "global",  # "global" | "perimage" | "none"
+    vmin_vmax: Optional[Tuple[float, float]] = None,
+) -> np.ndarray:
+    """
+    Render (H,W,K,C) -> uint8 (H,W,3).
+
+    - norm="global": expects vmin_vmax (lo,hi) computed from REAL renders; applied to both real & fake.
+    - norm="perimage": robust percentiles computed per image.
+    - norm="none": no rescale; just clip to [0,1].
+    """
+    img = _select_image_from_vol(vol, mode)
+
+    if norm == "none":
+        img01 = np.clip(img, 0.0, 1.0)
+        return (img01 * 255.0 + 0.5).astype(np.uint8)
+
+    if norm == "global":
+        if vmin_vmax is None:
+            raise ValueError("render_rgb(norm='global') requires vmin_vmax=(lo,hi).")
+        lo, hi = float(vmin_vmax[0]), float(vmin_vmax[1])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            # fallback to per-image robust range
+            lo = float(np.percentile(img, 1.0))
+            hi = float(np.percentile(img, 99.0)) + 1e-6
+    elif norm == "perimage":
+        lo = float(np.percentile(img, 1.0))
+        hi = float(np.percentile(img, 99.0))
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = float(img.min()), float(img.max()) + 1e-6
     else:
-        lo, hi = float(vmin), float(vmax)
-        if hi <= lo:
-            hi = lo + 1e-6
+        raise ValueError(f"Unknown render norm: {norm}")
 
-    img01 = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+    img01 = np.clip((img - lo) / (hi - lo + 1e-12), 0.0, 1.0)
     return (img01 * 255.0 + 0.5).astype(np.uint8)
+
+
+def compute_global_range_from_real(
+    real_vol: np.ndarray, render_mode: str, pct_lo: float = 1.0, pct_hi: float = 99.0
+) -> Tuple[float, float]:
+    """
+    Compute (lo,hi) in IMAGE space for the chosen render_mode using robust percentiles
+    over ALL real renders (no scaling applied yet).
+    """
+    # To avoid huge memory spikes, stream through volumes
+    lows, highs = [], []
+    for v in real_vol:
+        img = _select_image_from_vol(v, render_mode)
+        lo = np.percentile(img, pct_lo)
+        hi = np.percentile(img, pct_hi)
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            lows.append(lo)
+            highs.append(hi)
+    if not lows:
+        # ultimate fallback from raw tensor
+        lo = float(np.percentile(real_vol, pct_lo))
+        hi = float(np.percentile(real_vol, pct_hi))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(real_vol.min()), float(real_vol.max()) + 1e-6
+        return lo, hi
+
+    # Use medians of per-image percentiles (robust across outliers)
+    lo = float(np.median(np.array(lows)))
+    hi = float(np.median(np.array(highs)))
+    if hi <= lo:
+        hi = lo + 1e-6
+    return lo, hi
 
 
 # ----------------------- PSNR / SSIM -----------------------
@@ -177,8 +230,8 @@ def _cov_mean(
 
 def _sqrtm_psd(A: np.ndarray) -> np.ndarray:
     if HAS_SCIPY:
-        X = scipy_sqrtm(A)  # type:ignore
-        return X.real if np.iscomplexobj(X) else X  # type:ignore
+        X = scipy_sqrtm(A)  # type: ignore
+        return X.real if np.iscomplexobj(X) else X  # type: ignore
     w, V = np.linalg.eigh(A)
     w = np.clip(w, 0.0, None)
     return (V * np.sqrt(w)) @ V.T
@@ -322,8 +375,8 @@ def main():
         "--render_norm",
         type=str,
         default="global",
-        choices=["global", "perimage"],
-        help="Global uses vmin/vmax from real set; perimage uses per-image percentiles.",
+        choices=["global", "perimage", "none"],
+        help="global: one (vmin,vmax) from real renders; perimage: per-image; none: clip to [0,1].",
     )
     ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
 
@@ -366,12 +419,6 @@ def main():
     if real_labels is not None:
         real_labels = real_labels[:Nr]
 
-    # Global normalization range (robust) from real set
-    g_lo = float(np.percentile(real_vol, 1.0))
-    g_hi = float(np.percentile(real_vol, 99.0))
-    if not np.isfinite(g_lo) or not np.isfinite(g_hi) or g_hi <= g_lo:
-        g_lo, g_hi = float(real_vol.min()), float(real_vol.max()) + 1e-6
-
     # -------- Generated data (.npz or .npy) --------
     gen_files = sorted(glob(args.gen_glob))
     if len(gen_files) == 0:
@@ -403,13 +450,30 @@ def main():
     if gen_labels is not None:
         gen_labels = np.asarray(gen_labels)[:Nf]
 
-    # -------- Render to RGB --------
+    # -------- Normalization stats (global -> image-space robust range from REAL renders) --------
+    vmin_vmax_global: Optional[Tuple[float, float]] = None
     if args.render_norm == "global":
-        real_imgs = [to_pil(render_rgb(v, args.render, g_lo, g_hi)) for v in real_vol]
-        fake_imgs = [to_pil(render_rgb(v, args.render, g_lo, g_hi)) for v in gen_vol]
-    else:
-        real_imgs = [to_pil(render_rgb(v, args.render)) for v in real_vol]
-        fake_imgs = [to_pil(render_rgb(v, args.render)) for v in gen_vol]
+        vmin_vmax_global = compute_global_range_from_real(
+            real_vol, args.render, 1.0, 99.0
+        )
+
+    # -------- Render to RGB --------
+    real_imgs = [
+        to_pil(
+            render_rgb(
+                v, args.render, norm=args.render_norm, vmin_vmax=vmin_vmax_global
+            )
+        )
+        for v in real_vol
+    ]
+    fake_imgs = [
+        to_pil(
+            render_rgb(
+                v, args.render, norm=args.render_norm, vmin_vmax=vmin_vmax_global
+            )
+        )
+        for v in gen_vol
+    ]
 
     grid_image(real_imgs[:64], nrow=8).save(outdir / "figs/real_grid.png")
     grid_image(fake_imgs[:64], nrow=8).save(outdir / "figs/fake_grid.png")
@@ -435,7 +499,7 @@ def main():
                 pseudo_mode = "provided"
             elif real_labels is not None:
                 if args.pseudo_label == "meanrgb":
-                    cents = {}
+                    cents: Dict[int, np.ndarray] = {}
                     L = real_labels.astype(int)
                     for c in np.unique(L):
                         idx = np.where(L == c)[0]
@@ -451,7 +515,7 @@ def main():
                     fake_labels = classes[np.argmin(d2, axis=1)]
                     pseudo_mode = "meanrgb"
                 elif args.pseudo_label == "inception":
-                    cents = {}
+                    cents: Dict[int, np.ndarray] = {}
                     L = real_labels.astype(int)
                     for c in np.unique(L):
                         idx = np.where(L == c)[0]
@@ -464,10 +528,10 @@ def main():
                     fake_labels = classes[np.argmin(d2, axis=1)]
                     pseudo_mode = "inception"
 
-    # -------- FID/KID (global) --------
-    global_FID = None
-    global_KID_mean = None
-    global_KID_std = None
+    # -------- FID/KID (global, guarded) --------
+    global_FID: Optional[float] = None
+    global_KID_mean: Optional[float] = None
+    global_KID_std: Optional[float] = None
     if min(feats_real.shape[0], feats_fake.shape[0]) >= args.min_fid_n:
         global_FID = fid_from_feats(feats_real, feats_fake)
         global_KID_mean, global_KID_std = kid_from_feats(
@@ -513,6 +577,11 @@ def main():
         for c in sorted(set(gr.keys()) & set(gf.keys())):
             pairs += pairs_within_class(gr[c], gf[c], args.limit_per_class, rng_np)
 
+    # Save the actual index pairs for transparency
+    pairs_json = [{"real_idx": int(ir), "fake_idx": int(jf)} for ir, jf in pairs]
+    with open(outdir / "diagnostics/pairs.json", "w") as f:
+        json.dump({"pairs": pairs_json}, f, indent=2)
+
     # Optional: save a grid of paired comparisons
     if args.save_pairs_grid and len(pairs) > 0:
         tiles = []
@@ -552,6 +621,25 @@ def main():
         plt.tight_layout()
         plt.savefig(outdir / "figs/ssim_hist.png")
         plt.close()
+
+    # Diagnostic: flatness vs SSIM
+    fake_stds = [float(np.std(np.asarray(im, np.float32))) for im in fake_imgs[:256]]
+    flat_ratio = float(np.mean([s < 1.0 for s in fake_stds])) if fake_stds else 0.0
+    if np.isfinite(np.nanmean(ssims)) and flat_ratio > 0.5 and np.nanmean(ssims) > 0.6:
+        print(
+            "[warn] Many fake renders are near-constant but SSIM is high. "
+            "Re-check --render_norm and pairing."
+        )
+    with open(outdir / "diagnostics/flat_stats.json", "w") as f:
+        json.dump(
+            {
+                "fake_std_mean": float(np.mean(fake_stds) if fake_stds else 0.0),
+                "fake_std_median": float(np.median(fake_stds) if fake_stds else 0.0),
+                "flat_ratio_<1.0": flat_ratio,
+            },
+            f,
+            indent=2,
+        )
 
     # -------- 3D viridis snapshots --------
     n3d = max(0, int(args.save_3d))
@@ -594,11 +682,11 @@ def main():
             "min_fid_n": int(args.min_fid_n),
             "has_gen_labels": bool(gen_labels is not None),
             "pseudo_label": (
-                pseudo_mode
-                if pseudo_mode is not None
+                "provided"
+                if gen_labels is not None
                 else (
-                    "provided"
-                    if gen_labels is not None
+                    pseudo_mode
+                    if pseudo_mode is not None
                     else (args.pseudo_label if args.pairing == "class" else "n/a")
                 )
             ),
