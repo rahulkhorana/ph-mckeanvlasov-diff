@@ -17,14 +17,14 @@ Key features
 Run (examples)
 --------------
 ```python
-python eval_results.py \
-  --real_pt ../../datasets/unified_topological_data_v6_semifast.pt \
+python eval_results.py --real_pt ../../datasets/unified_topological_data_v6_semifast.pt \
   --gen_glob "../gpu-result/samples_landscapes.npz" \
   --outdir gen_results_fig/ \
   --max_samples 2000 \
-  --pairing class \
-  --render midk \
-  --device cpu
+  --render avgk \
+  --render_norm global \
+  --save_3d 24 \
+  --device cpu     
 ```
 
 Optional (if your saved .npy are still standardized):
