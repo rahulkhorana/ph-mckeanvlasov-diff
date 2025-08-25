@@ -25,6 +25,8 @@ python eval_results.py \
   --device cpu \
   --save_3d 24 \
   --eval_mode best_slice  
+  --calc_real_baseline
+  --calc_wasserstein
 ```
 
 Optional (if your saved .npy are still standardized):
