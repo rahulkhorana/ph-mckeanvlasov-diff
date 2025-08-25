@@ -1,4 +1,4 @@
-# eval_results.py — robust eval with detailed 3D landscape plots and full metrics
+# eval_results.py — robust eval with LPIPS, FID, PSNR, and 3D plots
 import argparse, json, math
 from pathlib import Path
 from glob import glob
@@ -33,16 +33,17 @@ try:
 except Exception:
     HAS_SCIPY = False
 
+import lpips
+
 from dataloader import load_packed_pt
 
+
 # ----------------------- Rendering / Plotting Helpers -----------------------
-
-
+# (These functions remain unchanged)
 def robust_scale(x: np.ndarray, clip_pct: float = 1.0) -> np.ndarray:
-    """Per-surface robust [0,1] scaling with percentile clipping."""
     a = x.copy()
     a[~np.isfinite(a)] = 0.0
-    if clip_pct and clip_pct > 0:
+    if clip_pct > 0:
         lo, hi = np.percentile(a, [clip_pct, 100.0 - clip_pct])
         if hi <= lo:
             hi = lo + 1e-6
@@ -62,14 +63,11 @@ def plot_landscape_grid(
     azim: float = -135,
     cmap: str = "viridis",
 ):
-    """Saves a detailed 3D plot of a single (H,W,K,C) volume."""
     H, W, K, C = sample.shape
-    assert C == 3, f"Expected 3 channels (degrees), got {C}"
+    assert C == 3
     X, Y = np.meshgrid(np.arange(W), np.arange(H))
-
     fig = plt.figure(figsize=(4 * K, 3 * C))
     fig.suptitle(title, y=0.98, fontsize=16)
-
     for c_idx in range(C):
         for k_idx in range(K):
             Z = robust_scale(sample[:, :, k_idx, c_idx])
@@ -91,7 +89,6 @@ def plot_landscape_grid(
             ax.view_init(elev=elev, azim=azim)
             ax.set_box_aspect((1, 1, 0.4))
             ax.set_title(f"Degree {c_idx}, Slice {k_idx}", pad=8, fontsize=10)
-
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
@@ -132,7 +129,7 @@ def compute_global_range_from_real(real_vol, render_mode):
     return np.percentile(all_vals, 1.0), np.percentile(all_vals, 99.0)
 
 
-# ----------------------- PSNR / SSIM -----------------------
+# ----------------------- Metric Calculation Classes & Functions -----------------------
 def psnr_img(a, b, data_range=255.0):
     return 20 * math.log10(data_range) - 10 * math.log10(np.mean((a - b) ** 2))
 
@@ -149,12 +146,9 @@ def psnr_3d(a, b, data_range):
     return 20 * math.log10(data_range) - 10 * math.log10(np.mean((a - b) ** 2))
 
 
-# ----------------------- Inception features / FID / KID -----------------------
 class InceptionFeatures(nn.Module):
     def __init__(self, device):
         super().__init__()
-        # --- THIS IS THE FIX ---
-        # The pretrained weights for 'IMAGENET1K_V1' require aux_logits=True
         model = inception_v3(weights="IMAGENET1K_V1", aux_logits=True)
         self.tfm = transforms.Compose(
             [
@@ -182,25 +176,35 @@ class InceptionFeatures(nn.Module):
         return np.concatenate(feats, 0) if feats else np.empty((0, 2048))
 
 
-def _cov_mean(X):
-    mu = X.mean(axis=0)
-    return mu, np.cov(X, rowvar=False)
+class LPIPSMetric:
+    """Calculates Learned Perceptual Image Patch Similarity."""
 
+    def __init__(self, device):
+        self.model = lpips.LPIPS(net="alex").to(device)
+        self.model.eval()
+        self.device = device
+        # LPIPS model expects images normalized to [-1, 1]
+        self.transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+            ]
+        )
 
-def _sqrtm_psd(A):
-    return scipy_sqrtm(A).real if HAS_SCIPY else np.zeros_like(A)  # type: ignore
+    @torch.no_grad()
+    def calculate(self, img1: Image.Image, img2: Image.Image) -> float:
+        img1_t = self.transform(img1).unsqueeze(0).to(self.device)  # type: ignore
+        img2_t = self.transform(img2).unsqueeze(0).to(self.device)  # type: ignore
+        dist = self.model(img1_t, img2_t)
+        return dist.item()
 
 
 def fid_from_feats(fr, ff):
-    mu_r, Cr = _cov_mean(fr)
-    mu_f, Cf = _cov_mean(ff)
+    mu_r, Cr = np.mean(fr, 0), np.cov(fr, rowvar=False)
+    mu_f, Cf = np.mean(ff, 0), np.cov(ff, rowvar=False)
     d = np.sum((mu_r - mu_f) ** 2)
-    Csr = _sqrtm_psd(Cr @ Cf)
+    Csr = scipy_sqrtm(Cr @ Cf).real if HAS_SCIPY else np.zeros_like(Cr)  # type: ignore
     return max(0, d + np.trace(Cr + Cf - 2 * Csr))
-
-
-def _poly_kernel(x, y):
-    return (x @ y.T / x.shape[1] + 1) ** 3
 
 
 def kid_from_feats(fr, ff, n_sub=100, sub_size=1000, rng=None):
@@ -211,13 +215,11 @@ def kid_from_feats(fr, ff, n_sub=100, sub_size=1000, rng=None):
     vals = []
     for _ in range(n_sub):
         xr, xf = fr[rng.choice(len(fr), m, False)], ff[rng.choice(len(ff), m, False)]
-        k_rr, k_ff, k_rf = (
-            _poly_kernel(xr, xr),
-            _poly_kernel(xf, xf),
-            _poly_kernel(xr, xf),
-        )
+        k_rr = (xr @ xr.T / xr.shape[1] + 1) ** 3
         np.fill_diagonal(k_rr, 0)
+        k_ff = (xf @ xf.T / xf.shape[1] + 1) ** 3
         np.fill_diagonal(k_ff, 0)
+        k_rf = (xr @ xf.T / xr.shape[1] + 1) ** 3
         mmd2 = k_rr.sum() / (m * (m - 1)) + k_ff.sum() / (m * (m - 1)) - 2 * k_rf.mean()
         vals.append(mmd2)
     return np.mean(vals), np.std(vals)
@@ -228,22 +230,9 @@ def to_pil(img):
     return Image.fromarray(img)
 
 
-def grid_image(pils, nrow=8, pad=2, bg=255):
-    w, h = pils[0].size
-    ncol = nrow
-    rows = (len(pils) + ncol - 1) // ncol
-    canvas = Image.new(
-        "RGB", (ncol * w + (ncol - 1) * pad, rows * h + (rows - 1) * pad), (bg, bg, bg)
-    )
-    for i, im in enumerate(pils):
-        canvas.paste(im, ((i % ncol) * (w + pad), (i // ncol) * (h + pad)))
-    return canvas
-
-
 def group_indices(labels):
     out = {}
-    for i, c in enumerate(labels.astype(int)):
-        out.setdefault(c, []).append(i)
+    [out.setdefault(c, []).append(i) for i, c in enumerate(labels.astype(int))]
     return {k: np.array(v) for k, v in out.items()}
 
 
@@ -260,7 +249,7 @@ def main():
     ap.add_argument(
         "--pairing", type=str, default="class", choices=["class", "random", "paired"]
     )
-    ap.add_argument("--per_class_fid", type=bool, default=True)
+    ap.add_argument("--per_class_fid", action="store_true")
     ap.add_argument("--min_fid_n", type=int, default=20)
     ap.add_argument("--save_3d", type=int, default=40)
     args = ap.parse_args()
@@ -270,11 +259,10 @@ def main():
     (outdir / "landscapes").mkdir(parents=True, exist_ok=True)
 
     pack = load_packed_pt(args.real_pt, require_modules=False)
-    real_vol, real_labels = np.asarray(pack["vol"]), np.asarray(pack.get("labels"))
-    real_vol, real_labels = real_vol[: args.max_samples], (
-        real_labels[: args.max_samples] if real_labels is not None else None
+    real_vol, real_labels = (
+        np.asarray(pack["vol"])[: args.max_samples],
+        np.asarray(pack.get("labels"))[: args.max_samples],
     )
-
     gen_files = sorted(glob(args.gen_glob))
     if not gen_files:
         raise FileNotFoundError(f"No files for glob: {args.gen_glob}")
@@ -301,6 +289,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     inc = InceptionFeatures(device)
     feats_real, feats_fake = inc(real_imgs), inc(fake_imgs)
+    lpips_metric = LPIPSMetric(device)
 
     global_fid = fid_from_feats(feats_real, feats_fake)
     global_kid_mean, global_kid_std = kid_from_feats(feats_real, feats_fake)
@@ -316,11 +305,12 @@ def main():
     elif args.pairing == "class" and real_labels is not None and gen_labels is not None:
         gr, gf = group_indices(real_labels), group_indices(gen_labels)
         pairs = []
-        for c in sorted(set(gr.keys()) & set(gf.keys())):
-            ir, jf = gr[c], gf[c]
-            rng.shuffle(ir)
-            rng.shuffle(jf)
+        [
             pairs.extend(zip(ir[: min(len(ir), len(jf))], jf[: min(len(ir), len(jf))]))
+            for c in sorted(set(gr.keys()) & set(gf.keys()))
+            for ir, jf in [(gr[c], gf[c])]
+            for _ in [rng.shuffle(ir), rng.shuffle(jf)]
+        ]
     else:
         m = min(len(real_imgs), len(fake_imgs))
         pairs = list(
@@ -330,12 +320,14 @@ def main():
             )
         )
 
-    psnrs, ssims, psnrs3d = [], [], []
+    psnrs, ssims, psnrs3d, lpips_scores = [], [], [], []
     v_min, v_max = np.percentile(real_vol, [0.1, 99.9])
     for ir, jf in pairs:
         psnrs.append(psnr_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
         ssims.append(ssim_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
         psnrs3d.append(psnr_3d(real_vol[ir], gen_vol[jf], data_range=v_max - v_min))
+        if lpips_metric:
+            lpips_scores.append(lpips_metric.calculate(real_imgs[ir], fake_imgs[jf]))
 
     per_class_metrics = {}
     if args.per_class_fid and real_labels is not None and gen_labels is not None:
@@ -359,15 +351,19 @@ def main():
 
     metrics = {
         "counts": {"real": len(real_vol), "fake": len(gen_vol), "pairs": len(pairs)},
-        "PSNR_mean": float(np.mean(psnrs)),
-        "PSNR_std": float(np.std(psnrs)),
-        "SSIM_mean": float(np.nanmean(ssims)),
-        "SSIM_std": float(np.nanstd(ssims)),
-        "PSNR_3D_mean": float(np.mean(psnrs3d)),
-        "PSNR_3D_std": float(np.std(psnrs3d)),
-        "global_FID": float(global_fid),
-        "global_KID_mean": float(global_kid_mean),
-        "global_KID_std": float(global_kid_std),
+        "PSNR_mean": float(np.mean(psnrs)) if psnrs else None,
+        "PSNR_std": float(np.std(psnrs)) if psnrs else None,
+        "SSIM_mean": float(np.nanmean(ssims)) if ssims else None,
+        "SSIM_std": float(np.nanstd(ssims)) if ssims else None,
+        "LPIPS_mean": float(np.mean(lpips_scores)) if lpips_scores else None,
+        "LPIPS_std": float(np.std(lpips_scores)) if lpips_scores else None,
+        "PSNR_3D_mean": float(np.mean(psnrs3d)) if psnrs3d else None,
+        "PSNR_3D_std": float(np.std(psnrs3d)) if psnrs3d else None,
+        "global_FID": float(global_fid) if global_fid is not None else None,
+        "global_KID_mean": (
+            float(global_kid_mean) if global_kid_mean is not None else None
+        ),
+        "global_KID_std": float(global_kid_std) if global_kid_std is not None else None,
         "per_class": per_class_metrics,
     }
     with open(outdir / "metrics.json", "w") as f:
