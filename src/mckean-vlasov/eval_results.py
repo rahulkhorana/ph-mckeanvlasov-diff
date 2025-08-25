@@ -1,4 +1,4 @@
-# eval_results.py — robust eval with LPIPS, FID, PSNR, and 3D plots
+# eval_results.py — robust eval with LPIPS, FID, PSNR, 3D plots, and Best-Slice mode
 import argparse, json, math
 from pathlib import Path
 from glob import glob
@@ -33,13 +33,17 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-import lpips
+try:
+    import lpips
+
+    HAS_LPIPS = True
+except ImportError:
+    HAS_LPIPS = False
 
 from dataloader import load_packed_pt
 
 
 # ----------------------- Rendering / Plotting Helpers -----------------------
-# (These functions remain unchanged)
 def robust_scale(x: np.ndarray, clip_pct: float = 1.0) -> np.ndarray:
     a = x.copy()
     a[~np.isfinite(a)] = 0.0
@@ -177,13 +181,12 @@ class InceptionFeatures(nn.Module):
 
 
 class LPIPSMetric:
-    """Calculates Learned Perceptual Image Patch Similarity."""
-
     def __init__(self, device):
-        self.model = lpips.LPIPS(net="alex").to(device)
+        if not HAS_LPIPS:
+            raise ImportError("LPIPS metric requires 'pip install lpips'")
+        self.model = lpips.LPIPS(net="alex").to(device)  # type: ignore
         self.model.eval()
         self.device = device
-        # LPIPS model expects images normalized to [-1, 1]
         self.transform = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -195,8 +198,7 @@ class LPIPSMetric:
     def calculate(self, img1: Image.Image, img2: Image.Image) -> float:
         img1_t = self.transform(img1).unsqueeze(0).to(self.device)  # type: ignore
         img2_t = self.transform(img2).unsqueeze(0).to(self.device)  # type: ignore
-        dist = self.model(img1_t, img2_t)
-        return dist.item()
+        return self.model(img1_t, img2_t).item()
 
 
 def fid_from_feats(fr, ff):
@@ -225,7 +227,6 @@ def kid_from_feats(fr, ff, n_sub=100, sub_size=1000, rng=None):
     return np.mean(vals), np.std(vals)
 
 
-# ----------------------- Utilities -----------------------
 def to_pil(img):
     return Image.fromarray(img)
 
@@ -252,6 +253,13 @@ def main():
     ap.add_argument("--per_class_fid", action="store_true")
     ap.add_argument("--min_fid_n", type=int, default=20)
     ap.add_argument("--save_3d", type=int, default=40)
+    ap.add_argument(
+        "--eval_mode",
+        type=str,
+        default="render",
+        choices=["render", "best_slice"],
+        help="Evaluation mode for perceptual metrics.",
+    )
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -289,7 +297,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     inc = InceptionFeatures(device)
     feats_real, feats_fake = inc(real_imgs), inc(fake_imgs)
-    lpips_metric = LPIPSMetric(device)
+    lpips_metric = LPIPSMetric(device) if HAS_LPIPS else None
 
     global_fid = fid_from_feats(feats_real, feats_fake)
     global_kid_mean, global_kid_std = kid_from_feats(feats_real, feats_fake)
@@ -322,12 +330,44 @@ def main():
 
     psnrs, ssims, psnrs3d, lpips_scores = [], [], [], []
     v_min, v_max = np.percentile(real_vol, [0.1, 99.9])
-    for ir, jf in pairs:
-        psnrs.append(psnr_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
-        ssims.append(ssim_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
-        psnrs3d.append(psnr_3d(real_vol[ir], gen_vol[jf], data_range=v_max - v_min))
-        if lpips_metric:
-            lpips_scores.append(lpips_metric.calculate(real_imgs[ir], fake_imgs[jf]))
+
+    if args.eval_mode == "best_slice":
+        print("Running in 'best_slice' evaluation mode for LPIPS/SSIM...")
+        for ir, jf in pairs:
+            real_v, fake_v = real_vol[ir], gen_vol[jf]
+            K = real_v.shape[2]
+            slice_lpips, slice_ssims = [], []
+            for k in range(K):
+                real_slice_img = to_pil(
+                    render_rgb(real_v, f"slice:k={k}", args.render_norm, vmin_vmax)
+                )
+                fake_slice_img = to_pil(
+                    render_rgb(fake_v, f"slice:k={k}", args.render_norm, vmin_vmax)
+                )
+                if lpips_metric:
+                    slice_lpips.append(
+                        lpips_metric.calculate(real_slice_img, fake_slice_img)
+                    )
+                if HAS_SKIMAGE:
+                    slice_ssims.append(
+                        ssim_img(np.array(real_slice_img), np.array(fake_slice_img))
+                    )
+            if slice_lpips:
+                lpips_scores.append(min(slice_lpips))
+            if slice_ssims:
+                ssims.append(max(slice_ssims))
+            psnrs.append(psnr_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
+            psnrs3d.append(psnr_3d(real_v, fake_v, data_range=v_max - v_min))
+    else:  # Default 'render' mode
+        for ir, jf in pairs:
+            psnrs.append(psnr_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
+            if HAS_SKIMAGE:
+                ssims.append(ssim_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
+            psnrs3d.append(psnr_3d(real_vol[ir], gen_vol[jf], data_range=v_max - v_min))
+            if lpips_metric:
+                lpips_scores.append(
+                    lpips_metric.calculate(real_imgs[ir], fake_imgs[jf])
+                )
 
     per_class_metrics = {}
     if args.per_class_fid and real_labels is not None and gen_labels is not None:
@@ -351,6 +391,7 @@ def main():
 
     metrics = {
         "counts": {"real": len(real_vol), "fake": len(gen_vol), "pairs": len(pairs)},
+        "eval_mode": args.eval_mode,
         "PSNR_mean": float(np.mean(psnrs)) if psnrs else None,
         "PSNR_std": float(np.std(psnrs)) if psnrs else None,
         "SSIM_mean": float(np.nanmean(ssims)) if ssims else None,
