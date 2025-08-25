@@ -75,7 +75,7 @@ def main():
     pack = load_packed_pt(args.data_pt, require_modules=True)
     describe(pack)
     train_ds, val_ds, norm_meta = train_val_split(
-        pack, val_frac=0.1, seed=42, normalize=True
+        pack, val_frac=0.2, seed=42, normalize=True
     )
     H, W, K, C = train_ds.vol.shape[1:]
     num_classes = int(pack.get("labels", np.array([-1])).max() + 1)
@@ -151,7 +151,7 @@ def main():
             )
 
     print("[sample] Starting generation...")
-    val_it = iterate_batches(val_ds, args.batch, shuffle=False, seed=123, epochs=1)
+    val_it = iterate_batches(val_ds, args.batch, shuffle=False, seed=123, epochs=None)
     samples_all, labels_all = [], []
     total_target = args.sample_count
     produced = 0

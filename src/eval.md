@@ -21,11 +21,8 @@ python eval_results.py --real_pt ../../datasets/unified_topological_data_v6_semi
   --gen_glob "../gpu-result/samples_landscapes.npz" \
   --outdir gen_results_fig/ \
   --max_samples 2000 \
-  --pairing paired \
   --render avgk \
   --render_norm global \
-  --min_fid_n 200 \
-  --batch_size 64 \
   --save_3d 24 \
   --device cpu     
 ```

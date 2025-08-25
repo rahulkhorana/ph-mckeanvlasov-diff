@@ -1,4 +1,4 @@
-# sampling.py — MV-SDE with CFG, v-pred, and SOTA Denoised Guidance
+# sampling.py — MV-SDE with CFG, v-pred, and SOTA Denoised Guidance (Corrected JIT)
 import jax, jax.numpy as jnp
 from models import time_embed
 from functools import partial
@@ -35,17 +35,6 @@ def _choose_mf(mode: str):
 
 
 # ---------- Sampler with Denoised Guidance ----------
-@partial(
-    jax.jit,
-    static_argnames=(
-        "unet_apply",
-        "guidance_apply",
-        "steps",
-        "v_pred",
-        "mf_mode",
-        "return_all",
-    ),
-)
 def mv_sde_sample_guided(
     unet_apply,
     unet_params,
@@ -66,15 +55,19 @@ def mv_sde_sample_guided(
     mf_mode: str,
     mf_lambda: float,
     mf_bandwidth: float,
-    return_all: bool = False,
+    return_all: bool = False,  # This argument is kept for API consistency but not used with fori_loop
 ):
     T = alpha_bars.shape[0]
     ts = jnp.linspace(T - 1, 1, steps).round().astype(jnp.int32)
+
+    # This is now called with a concrete shape, fixing the error.
     x = jax.random.normal(rng, shape)
-    traj = []
+
     mf_fn = _choose_mf(mf_mode)
 
-    for t_idx in ts:
+    # This inner function will be compiled by fori_loop
+    def loop_body(i, x_current):
+        t_idx = ts[i]
         t = jnp.full((shape[0],), t_idx, dtype=jnp.int32)
         a_t = alpha_bars[t][:, None, None, None, None]
         a_tm1 = alpha_bars[jnp.maximum(t - 1, 0)][:, None, None, None, None]
@@ -84,29 +77,34 @@ def mv_sde_sample_guided(
         temb = time_embed(jnp.squeeze(t_cont), dim=128)
 
         prediction = _cfg_pred(
-            unet_apply, unet_params, x, temb, cond_vec, cfg_scale, cond_uncond_vec
+            unet_apply,
+            unet_params,
+            x_current,
+            temb,
+            cond_vec,
+            cfg_scale,
+            cond_uncond_vec,
         )
         x0_hat_unet = (
-            (sqrt_ab * x - sqrt_1ab * prediction)
+            (sqrt_ab * x_current - sqrt_1ab * prediction)
             if v_pred
-            else ((x - sqrt_1ab * prediction) / jnp.clip(sqrt_ab, 1e-8))
+            else ((x_current - sqrt_1ab * prediction) / jnp.clip(sqrt_ab, 1e-8))
         )
 
+        x0_hat = x0_hat_unet
         if use_guidance:
             x0_hat_guidance = guidance_apply(
-                {"params": guidance_params}, x, temb, cond_vec
+                {"params": guidance_params}, x_current, temb, cond_vec
             )
             x0_hat = x0_hat_unet + guidance_scale * (x0_hat_guidance - x0_hat_unet)
-        else:
-            x0_hat = x0_hat_unet
 
         if mf_mode != "none" and mf_lambda != 0.0:
             drift = mf_fn(x0_hat, bandwidth=mf_bandwidth)
             x0_hat = x0_hat + mf_lambda * drift
 
-        x = jnp.sqrt(a_tm1) * x0_hat
+        x_next = jnp.sqrt(a_tm1) * x0_hat
+        return x_next
 
-        if return_all:
-            traj.append(x)
-
-    return jnp.stack(traj, 1) if return_all else x
+    # Use jax.lax.fori_loop for an optimized, compiled sampling loop
+    final_x = jax.lax.fori_loop(0, steps, loop_body, x)
+    return final_x
