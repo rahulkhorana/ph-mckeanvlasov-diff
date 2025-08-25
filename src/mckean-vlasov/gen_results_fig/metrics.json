@@ -5,16 +5,15 @@
     "pairs": 1024
   },
   "eval_mode": "best_slice",
-  "PSNR_mean": 31.95792696226973,
-  "PSNR_std": 0.3997746680482097,
+  "Landscape_L2_Distance_mean": 64.66514139366684,
+  "Landscape_L2_Distance_std": 9.703090118507166,
+  "Real_vs_Real_L2_Baseline": 40.298391366720196,
+  "Wasserstein_Distance_mean": 0.02947325983414653,
+  "Wasserstein_Distance_std": 0.009830822848165728,
+  "Real_vs_Real_Wasserstein_Baseline": 0.015397248116393966,
   "SSIM_mean": 0.7551713736047106,
   "SSIM_std": 0.03360168527972275,
   "LPIPS_mean": 0.3013189254561439,
   "LPIPS_std": 0.06178230271287944,
-  "PSNR_3D_mean": 15.510215454114064,
-  "PSNR_3D_std": 1.3869794935831503,
-  "global_FID": 128.0667516269948,
-  "global_KID_mean": 0.1071322038769722,
-  "global_KID_std": 0.0011687910882756114,
-  "per_class": {}
+  "global_FID": 128.0667516269948
 }

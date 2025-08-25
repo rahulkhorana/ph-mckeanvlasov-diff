@@ -1,4 +1,4 @@
-# eval_results.py — robust eval with LPIPS, FID, PSNR, 3D plots, and Best-Slice mode
+# eval_results.py — robust eval with LPIPS, FID, L2, and Wasserstein Distance + Baselines
 import argparse, json, math
 from pathlib import Path
 from glob import glob
@@ -28,6 +28,7 @@ except Exception:
 
 try:
     from scipy.linalg import sqrtm as scipy_sqrtm
+    from scipy.stats import wasserstein_distance
 
     HAS_SCIPY = True
 except Exception:
@@ -134,6 +135,51 @@ def compute_global_range_from_real(real_vol, render_mode):
 
 
 # ----------------------- Metric Calculation Classes & Functions -----------------------
+def landscape_l2_distance(vol_real: np.ndarray, vol_fake: np.ndarray) -> float:
+    real = np.nan_to_num(vol_real)
+    fake = np.nan_to_num(vol_fake)
+    return float(np.linalg.norm(real - fake))
+
+
+def landscape_wasserstein_distance(vol_real: np.ndarray, vol_fake: np.ndarray) -> float:
+    """Calculates the 1-Wasserstein distance between the flattened landscape distributions."""
+    if not HAS_SCIPY:
+        return np.nan
+    real = np.nan_to_num(vol_real).ravel()
+    fake = np.nan_to_num(vol_fake).ravel()
+    return float(wasserstein_distance(real, fake))  # type: ignore
+
+
+def calculate_real_vs_real_baseline(
+    real_vol: np.ndarray,
+    real_labels: np.ndarray,
+    metric_fn,
+    max_pairs_per_class: int = 1000,
+) -> Optional[float]:
+    if real_labels is None:
+        return None
+    print(f"Calculating real-vs-real baseline for {metric_fn.__name__}...")
+    grouped_indices = group_indices(real_labels)
+    all_distances = []
+    rng = np.random.RandomState(42)
+    for indices in grouped_indices.values():
+        if len(indices) < 2:
+            continue
+        pairs = [
+            (indices[i], indices[j])
+            for i in range(len(indices))
+            for j in range(i + 1, len(indices))
+        ]
+        if len(pairs) > max_pairs_per_class:
+            rng.shuffle(pairs)
+            pairs = pairs[:max_pairs_per_class]
+        for idx1, idx2 in pairs:
+            all_distances.append(metric_fn(real_vol[idx1], real_vol[idx2]))
+    if not all_distances:
+        return None
+    return float(np.mean(all_distances))
+
+
 def psnr_img(a, b, data_range=255.0):
     return 20 * math.log10(data_range) - 10 * math.log10(np.mean((a - b) ** 2))
 
@@ -144,10 +190,6 @@ def ssim_img(a, b):
         if HAS_SKIMAGE
         else np.nan
     )
-
-
-def psnr_3d(a, b, data_range):
-    return 20 * math.log10(data_range) - 10 * math.log10(np.mean((a - b) ** 2))
 
 
 class InceptionFeatures(nn.Module):
@@ -209,24 +251,6 @@ def fid_from_feats(fr, ff):
     return max(0, d + np.trace(Cr + Cf - 2 * Csr))
 
 
-def kid_from_feats(fr, ff, n_sub=100, sub_size=1000, rng=None):
-    rng = rng or np.random.RandomState(123)
-    m = min(sub_size, fr.shape[0], ff.shape[0])
-    if m < 20:
-        return np.nan, np.nan
-    vals = []
-    for _ in range(n_sub):
-        xr, xf = fr[rng.choice(len(fr), m, False)], ff[rng.choice(len(ff), m, False)]
-        k_rr = (xr @ xr.T / xr.shape[1] + 1) ** 3
-        np.fill_diagonal(k_rr, 0)
-        k_ff = (xf @ xf.T / xf.shape[1] + 1) ** 3
-        np.fill_diagonal(k_ff, 0)
-        k_rf = (xr @ xf.T / xr.shape[1] + 1) ** 3
-        mmd2 = k_rr.sum() / (m * (m - 1)) + k_ff.sum() / (m * (m - 1)) - 2 * k_rf.mean()
-        vals.append(mmd2)
-    return np.mean(vals), np.std(vals)
-
-
 def to_pil(img):
     return Image.fromarray(img)
 
@@ -250,15 +274,20 @@ def main():
     ap.add_argument(
         "--pairing", type=str, default="class", choices=["class", "random", "paired"]
     )
-    ap.add_argument("--per_class_fid", action="store_true")
-    ap.add_argument("--min_fid_n", type=int, default=20)
     ap.add_argument("--save_3d", type=int, default=40)
     ap.add_argument(
-        "--eval_mode",
-        type=str,
-        default="render",
-        choices=["render", "best_slice"],
-        help="Evaluation mode for perceptual metrics.",
+        "--eval_mode", type=str, default="best_slice", choices=["render", "best_slice"]
+    )
+    ap.add_argument(
+        "--calc_l2_baseline",
+        type=bool,
+        default=True,
+        help="Calculate the L2 distance baseline between real samples.",
+    )
+    ap.add_argument(
+        "--calc_wasserstein",
+        type=bool,
+        default=True,
     )
     args = ap.parse_args()
 
@@ -281,6 +310,19 @@ def main():
         : args.max_samples
     ]
 
+    real_l2_baseline = (
+        calculate_real_vs_real_baseline(real_vol, real_labels, landscape_l2_distance)
+        if args.calc_l2_baseline
+        else None
+    )
+    real_w_baseline = (
+        calculate_real_vs_real_baseline(
+            real_vol, real_labels, landscape_wasserstein_distance
+        )
+        if args.calc_wasserstein
+        else None
+    )
+
     vmin_vmax = (
         compute_global_range_from_real(real_vol, args.render)
         if args.render_norm == "global"
@@ -300,7 +342,6 @@ def main():
     lpips_metric = LPIPSMetric(device) if HAS_LPIPS else None
 
     global_fid = fid_from_feats(feats_real, feats_fake)
-    global_kid_mean, global_kid_std = kid_from_feats(feats_real, feats_fake)
 
     rng = np.random.RandomState(123)
     if args.pairing == "paired":
@@ -328,8 +369,7 @@ def main():
             )
         )
 
-    psnrs, ssims, psnrs3d, lpips_scores = [], [], [], []
-    v_min, v_max = np.percentile(real_vol, [0.1, 99.9])
+    ssims, lpips_scores, l2_distances, w_distances = [], [], [], []
 
     if args.eval_mode == "best_slice":
         print("Running in 'best_slice' evaluation mode for LPIPS/SSIM...")
@@ -356,28 +396,22 @@ def main():
                 lpips_scores.append(min(slice_lpips))
             if slice_ssims:
                 ssims.append(max(slice_ssims))
-            psnrs.append(psnr_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
-            psnrs3d.append(psnr_3d(real_v, fake_v, data_range=v_max - v_min))
+            l2_distances.append(landscape_l2_distance(real_v, fake_v))
+            if args.calc_wasserstein:
+                w_distances.append(landscape_wasserstein_distance(real_v, fake_v))
     else:  # Default 'render' mode
         for ir, jf in pairs:
-            psnrs.append(psnr_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
             if HAS_SKIMAGE:
                 ssims.append(ssim_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
-            psnrs3d.append(psnr_3d(real_vol[ir], gen_vol[jf], data_range=v_max - v_min))
             if lpips_metric:
                 lpips_scores.append(
                     lpips_metric.calculate(real_imgs[ir], fake_imgs[jf])
                 )
-
-    per_class_metrics = {}
-    if args.per_class_fid and real_labels is not None and gen_labels is not None:
-        gr, gf = group_indices(real_labels), group_indices(gen_labels)
-        for c in sorted(set(gr.keys()) & set(gf.keys())):
-            ir, jf = gr[c], gf[c]
-            if len(ir) >= args.min_fid_n and len(jf) >= args.min_fid_n:
-                per_class_metrics[str(c)] = {
-                    "fid": fid_from_feats(feats_real[ir], feats_fake[jf])
-                }
+            l2_distances.append(landscape_l2_distance(real_vol[ir], gen_vol[jf]))
+            if args.calc_wasserstein:
+                w_distances.append(
+                    landscape_wasserstein_distance(real_vol[ir], gen_vol[jf])
+                )
 
     n3d = max(0, int(args.save_3d))
     for i in range(min(n3d, len(real_vol))):
@@ -392,20 +426,23 @@ def main():
     metrics = {
         "counts": {"real": len(real_vol), "fake": len(gen_vol), "pairs": len(pairs)},
         "eval_mode": args.eval_mode,
-        "PSNR_mean": float(np.mean(psnrs)) if psnrs else None,
-        "PSNR_std": float(np.std(psnrs)) if psnrs else None,
+        "Landscape_L2_Distance_mean": (
+            float(np.mean(l2_distances)) if l2_distances else None
+        ),
+        "Landscape_L2_Distance_std": (
+            float(np.std(l2_distances)) if l2_distances else None
+        ),
+        "Real_vs_Real_L2_Baseline": real_l2_baseline,
+        "Wasserstein_Distance_mean": (
+            float(np.mean(w_distances)) if w_distances else None
+        ),
+        "Wasserstein_Distance_std": float(np.std(w_distances)) if w_distances else None,
+        "Real_vs_Real_Wasserstein_Baseline": real_w_baseline,
         "SSIM_mean": float(np.nanmean(ssims)) if ssims else None,
         "SSIM_std": float(np.nanstd(ssims)) if ssims else None,
         "LPIPS_mean": float(np.mean(lpips_scores)) if lpips_scores else None,
         "LPIPS_std": float(np.std(lpips_scores)) if lpips_scores else None,
-        "PSNR_3D_mean": float(np.mean(psnrs3d)) if psnrs3d else None,
-        "PSNR_3D_std": float(np.std(psnrs3d)) if psnrs3d else None,
         "global_FID": float(global_fid) if global_fid is not None else None,
-        "global_KID_mean": (
-            float(global_kid_mean) if global_kid_mean is not None else None
-        ),
-        "global_KID_std": float(global_kid_std) if global_kid_std is not None else None,
-        "per_class": per_class_metrics,
     }
     with open(outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
