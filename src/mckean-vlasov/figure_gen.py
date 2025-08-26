@@ -157,7 +157,7 @@ fig.add_trace(
 # --- 6. Style the Figure ---
 fig.update_layout(
     title_text="McKean-Vlasov SDE Trajectory with Evolving Landscapes",
-    template="plotly_dark",
+    template="plotly_white",
     height=1000,
     width=1200,
     scene=dict(
