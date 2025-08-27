@@ -4,7 +4,7 @@
     "fake": 512,
     "pairs": 512
   },
-  "eval_mode": "best_slice",
+  "eval_mode": "slice",
   "Landscape_L2_Distance_mean": 64.66514139366684,
   "Landscape_L2_Distance_std": 9.703090118507166,
   "Real_vs_Real_L2_Baseline_mean": 40.298391366720196,
@@ -23,10 +23,10 @@
     "null_hypothesis": "Difference is large (not equivalent)",
     "alternative_hypothesis": "Difference is small (equivalent)",
     "num_classes_paired": 8,
-    "equivalence_margin_ratio": 2.5,
-    "equivalence_margin_abs_diff": 60.447587050080294,
+    "equivalence_margin_ratio": 2,
+    "equivalence_margin_abs_diff": 40.298391366720196,
     "median_difference": 25.95757970562213,
-    "tost_p_value": 0.00390625,
+    "tost_p_value": 0.0078125,
     "is_equivalent": true
   },
   "Wasserstein_TOST": {

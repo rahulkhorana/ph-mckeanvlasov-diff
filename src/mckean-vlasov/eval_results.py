@@ -345,12 +345,18 @@ def main():
     )
     ap.add_argument("--save_3d", type=int, default=40)
     ap.add_argument(
-        "--eval_mode", type=str, default="best_slice", choices=["render", "best_slice"]
+        "--eval_mode", type=str, default="slice", choices=["render", "slice"]
     )
     ap.add_argument(
-        "--equivalence_margin",
+        "--equivalence_margin_wass",
         type=float,
         default=2.5,
+        help="Margin for TOST",
+    )
+    ap.add_argument(
+        "--equivalence_margin_l2",
+        type=float,
+        default=2,
         help="Margin for TOST",
     )
     args = ap.parse_args()
@@ -432,7 +438,7 @@ def main():
             landscape_wasserstein_distance(real_v, fake_v)
         )
 
-        if args.eval_mode == "best_slice":
+        if args.eval_mode == "slice":
             K = real_v.shape[2]
             slice_lpips, slice_ssims = [], []
             for k in range(K):
@@ -475,10 +481,10 @@ def main():
     # --- Non-Parametric Equivalence Testing (TOST) Block ---
     stats_results = {}
     stats_results["L2_Distance_TOST"] = perform_nonparametric_equivalence_tost(
-        dict(gen_l2_by_class), baseline_l2_by_class, args.equivalence_margin
+        dict(gen_l2_by_class), baseline_l2_by_class, args.equivalence_margin_l2
     )
     stats_results["Wasserstein_TOST"] = perform_nonparametric_equivalence_tost(
-        dict(gen_w_by_class), baseline_w_by_class, args.equivalence_margin
+        dict(gen_w_by_class), baseline_w_by_class, args.equivalence_margin_wass
     )
 
     # --- Aggregate stats for reporting ---
