@@ -24,9 +24,7 @@ python eval_results.py \
   --max_samples 2000 \
   --device cpu \
   --save_3d 24 \
-  --eval_mode best_slice  
-  --calc_real_baseline
-  --calc_wasserstein
+  --eval_mode best_slice
 ```
 
 Optional (if your saved .npy are still standardized):

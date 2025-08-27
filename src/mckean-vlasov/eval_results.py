@@ -3,6 +3,7 @@ import argparse, json, math
 from pathlib import Path
 from glob import glob
 from typing import Tuple, List, Optional, Dict
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -28,7 +29,7 @@ except Exception:
 
 try:
     from scipy.linalg import sqrtm as scipy_sqrtm
-    from scipy.stats import wasserstein_distance
+    from scipy.stats import wasserstein_distance, wilcoxon
 
     HAS_SCIPY = True
 except Exception:
@@ -150,19 +151,20 @@ def landscape_wasserstein_distance(vol_real: np.ndarray, vol_fake: np.ndarray) -
     return float(wasserstein_distance(real, fake))  # type: ignore
 
 
-def calculate_real_vs_real_baseline(
+def get_real_vs_real_baseline_scores_by_class(
     real_vol: np.ndarray,
     real_labels: np.ndarray,
     metric_fn,
     max_pairs_per_class: int = 1000,
-) -> Optional[float]:
+) -> Dict[int, List[float]]:
+    """Calculates all real-vs-real distance scores, grouped by class."""
+    scores_by_class = defaultdict(list)
     if real_labels is None:
-        return None
-    print(f"Calculating real-vs-real baseline for {metric_fn.__name__}...")
+        return scores_by_class
+    print(f"Calculating real-vs-real baseline scores for {metric_fn.__name__}...")
     grouped_indices = group_indices(real_labels)
-    all_distances = []
     rng = np.random.RandomState(42)
-    for indices in grouped_indices.values():
+    for class_label, indices in grouped_indices.items():
         if len(indices) < 2:
             continue
         pairs = [
@@ -174,10 +176,77 @@ def calculate_real_vs_real_baseline(
             rng.shuffle(pairs)
             pairs = pairs[:max_pairs_per_class]
         for idx1, idx2 in pairs:
-            all_distances.append(metric_fn(real_vol[idx1], real_vol[idx2]))
-    if not all_distances:
-        return None
-    return float(np.mean(all_distances))
+            dist = metric_fn(real_vol[idx1], real_vol[idx2])
+            scores_by_class[int(class_label)].append(dist)
+    return dict(scores_by_class)
+
+
+def perform_nonparametric_equivalence_tost(
+    gen_dists_by_class: Dict[int, List[float]],
+    baseline_dists_by_class: Dict[int, List[float]],
+    margin_ratio: float,
+    alpha: float = 0.05,
+) -> Dict:
+    """
+    Performs a non-parametric paired samples TOST using Wilcoxon signed-rank tests.
+    Null Hypothesis (H0): The difference is large (NOT equivalent).
+    Alternative Hypothesis (Ha): The difference is small (IS equivalent).
+    """
+    if not HAS_SCIPY:
+        return {"notes": "SciPy not found, skipping TOST."}
+
+    gen_means, baseline_means = [], []
+    common_classes = sorted(
+        set(gen_dists_by_class.keys()) & set(baseline_dists_by_class.keys())
+    )
+
+    for c in common_classes:
+        if gen_dists_by_class.get(c) and baseline_dists_by_class.get(c):
+            gen_means.append(np.mean(gen_dists_by_class[c]))
+            baseline_means.append(np.mean(baseline_dists_by_class[c]))
+
+    if len(gen_means) < 8:  # Wilcoxon is less reliable with very few pairs
+        return {"notes": f"Not enough paired classes ({len(gen_means)}) for TOST."}
+
+    gen_means = np.array(gen_means)
+    baseline_means = np.array(baseline_means)
+
+    mean_baseline = np.mean(baseline_means)
+    # The margin is the maximum allowed difference between gen_mean and baseline_mean
+    upper_bound_delta = mean_baseline * (margin_ratio - 1.0)
+    lower_bound_delta = -upper_bound_delta
+
+    diffs = gen_means - baseline_means
+    median_diff = np.median(diffs)
+
+    # H0_upper: median_diff >= upper_bound_delta -> Ha_upper: median_diff < upper_bound_delta
+    # We test if (diffs - upper_bound_delta) is significantly less than 0
+    try:
+        _, p_upper = wilcoxon(diffs - upper_bound_delta, alternative="less")  # type: ignore
+    except ValueError:
+        p_upper = 1.0  # Cannot reject null if all diffs are the same
+
+    # H0_lower: median_diff <= lower_bound_delta -> Ha_lower: median_diff > lower_bound_delta
+    # We test if (diffs - lower_bound_delta) is significantly greater than 0
+    try:
+        _, p_lower = wilcoxon(diffs - lower_bound_delta, alternative="greater")  # type: ignore
+    except ValueError:
+        p_lower = 1.0
+
+    tost_p_value = max(p_lower, p_upper)  # type: ignore
+    is_equivalent = tost_p_value < alpha
+
+    return {
+        "test_type": "Non-Parametric Paired Equivalence Test (Wilcoxon-TOST)",
+        "null_hypothesis": "Difference is large (not equivalent)",
+        "alternative_hypothesis": "Difference is small (equivalent)",
+        "num_classes_paired": len(diffs),
+        "equivalence_margin_ratio": margin_ratio,
+        "equivalence_margin_abs_diff": upper_bound_delta,
+        "median_difference": median_diff,
+        "tost_p_value": tost_p_value,
+        "is_equivalent": bool(is_equivalent),
+    }
 
 
 def psnr_img(a, b, data_range=255.0):
@@ -279,15 +348,10 @@ def main():
         "--eval_mode", type=str, default="best_slice", choices=["render", "best_slice"]
     )
     ap.add_argument(
-        "--calc_l2_baseline",
-        type=bool,
-        default=True,
-        help="Calculate the L2 distance baseline between real samples.",
-    )
-    ap.add_argument(
-        "--calc_wasserstein",
-        type=bool,
-        default=True,
+        "--equivalence_margin",
+        type=float,
+        default=2.5,
+        help="Margin for TOST",
     )
     args = ap.parse_args()
 
@@ -310,17 +374,11 @@ def main():
         : args.max_samples
     ]
 
-    real_l2_baseline = (
-        calculate_real_vs_real_baseline(real_vol, real_labels, landscape_l2_distance)
-        if args.calc_l2_baseline
-        else None
+    baseline_l2_by_class = get_real_vs_real_baseline_scores_by_class(
+        real_vol, real_labels, landscape_l2_distance
     )
-    real_w_baseline = (
-        calculate_real_vs_real_baseline(
-            real_vol, real_labels, landscape_wasserstein_distance
-        )
-        if args.calc_wasserstein
-        else None
+    baseline_w_by_class = get_real_vs_real_baseline_scores_by_class(
+        real_vol, real_labels, landscape_wasserstein_distance
     )
 
     vmin_vmax = (
@@ -345,36 +403,36 @@ def main():
 
     rng = np.random.RandomState(123)
     if args.pairing == "paired":
-        pairs = list(
-            zip(
-                range(min(len(real_imgs), len(fake_imgs))),
-                range(min(len(real_imgs), len(fake_imgs))),
-            )
-        )
+        pairs = list(zip(range(len(real_vol)), range(len(gen_vol))))
     elif args.pairing == "class" and real_labels is not None and gen_labels is not None:
         gr, gf = group_indices(real_labels), group_indices(gen_labels)
         pairs = []
-        [
-            pairs.extend(zip(ir[: min(len(ir), len(jf))], jf[: min(len(ir), len(jf))]))
-            for c in sorted(set(gr.keys()) & set(gf.keys()))
-            for ir, jf in [(gr[c], gf[c])]
-            for _ in [rng.shuffle(ir), rng.shuffle(jf)]
-        ]
+        for c in sorted(set(gr.keys()) & set(gf.keys())):
+            ir, jf = gr[c], gf[c]
+            rng.shuffle(ir)
+            rng.shuffle(jf)
+            min_len = min(len(ir), len(jf))
+            pairs.extend(zip(ir[:min_len], jf[:min_len]))
     else:
-        m = min(len(real_imgs), len(fake_imgs))
+        m = min(len(real_vol), len(gen_vol))
         pairs = list(
-            zip(
-                rng.choice(len(real_imgs), m, False),
-                rng.choice(len(fake_imgs), m, False),
-            )
+            zip(rng.choice(len(real_vol), m, False), rng.choice(len(gen_vol), m, False))
         )
 
-    ssims, lpips_scores, l2_distances, w_distances = [], [], [], []
+    ssims, lpips_scores = [], []
+    gen_l2_by_class = defaultdict(list)
+    gen_w_by_class = defaultdict(list)
 
-    if args.eval_mode == "best_slice":
-        print("Running in 'best_slice' evaluation mode for LPIPS/SSIM...")
-        for ir, jf in pairs:
-            real_v, fake_v = real_vol[ir], gen_vol[jf]
+    for ir, jf in pairs:
+        class_label = int(real_labels[ir])
+        real_v, fake_v = real_vol[ir], gen_vol[jf]
+
+        gen_l2_by_class[class_label].append(landscape_l2_distance(real_v, fake_v))
+        gen_w_by_class[class_label].append(
+            landscape_wasserstein_distance(real_v, fake_v)
+        )
+
+        if args.eval_mode == "best_slice":
             K = real_v.shape[2]
             slice_lpips, slice_ssims = [], []
             for k in range(K):
@@ -396,22 +454,13 @@ def main():
                 lpips_scores.append(min(slice_lpips))
             if slice_ssims:
                 ssims.append(max(slice_ssims))
-            l2_distances.append(landscape_l2_distance(real_v, fake_v))
-            if args.calc_wasserstein:
-                w_distances.append(landscape_wasserstein_distance(real_v, fake_v))
-    else:  # Default 'render' mode
-        for ir, jf in pairs:
-            if HAS_SKIMAGE:
-                ssims.append(ssim_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
+        else:  # 'render' mode
             if lpips_metric:
                 lpips_scores.append(
                     lpips_metric.calculate(real_imgs[ir], fake_imgs[jf])
                 )
-            l2_distances.append(landscape_l2_distance(real_vol[ir], gen_vol[jf]))
-            if args.calc_wasserstein:
-                w_distances.append(
-                    landscape_wasserstein_distance(real_vol[ir], gen_vol[jf])
-                )
+            if HAS_SKIMAGE:
+                ssims.append(ssim_img(np.array(real_imgs[ir]), np.array(fake_imgs[jf])))
 
     n3d = max(0, int(args.save_3d))
     for i in range(min(n3d, len(real_vol))):
@@ -423,27 +472,52 @@ def main():
             gen_vol[i], outdir / f"landscapes/fake_{i:03d}.png", f"Fake {i}"
         )
 
+    # --- Non-Parametric Equivalence Testing (TOST) Block ---
+    stats_results = {}
+    stats_results["L2_Distance_TOST"] = perform_nonparametric_equivalence_tost(
+        dict(gen_l2_by_class), baseline_l2_by_class, args.equivalence_margin
+    )
+    stats_results["Wasserstein_TOST"] = perform_nonparametric_equivalence_tost(
+        dict(gen_w_by_class), baseline_w_by_class, args.equivalence_margin
+    )
+
+    # --- Aggregate stats for reporting ---
+    all_l2_gen = [item for sublist in gen_l2_by_class.values() for item in sublist]
+    all_w_gen = [item for sublist in gen_w_by_class.values() for item in sublist]
+    all_l2_base = [
+        item for sublist in baseline_l2_by_class.values() for item in sublist
+    ]
+    all_w_base = [item for sublist in baseline_w_by_class.values() for item in sublist]
+
     metrics = {
         "counts": {"real": len(real_vol), "fake": len(gen_vol), "pairs": len(pairs)},
         "eval_mode": args.eval_mode,
         "Landscape_L2_Distance_mean": (
-            float(np.mean(l2_distances)) if l2_distances else None
+            float(np.mean(all_l2_gen)) if all_l2_gen else None
         ),
-        "Landscape_L2_Distance_std": (
-            float(np.std(l2_distances)) if l2_distances else None
+        "Landscape_L2_Distance_std": float(np.std(all_l2_gen)) if all_l2_gen else None,
+        "Real_vs_Real_L2_Baseline_mean": (
+            float(np.mean(all_l2_base)) if all_l2_base else None
         ),
-        "Real_vs_Real_L2_Baseline": real_l2_baseline,
-        "Wasserstein_Distance_mean": (
-            float(np.mean(w_distances)) if w_distances else None
+        "Real_vs_Real_L2_Baseline_std": (
+            float(np.std(all_l2_base)) if all_l2_base else None
         ),
-        "Wasserstein_Distance_std": float(np.std(w_distances)) if w_distances else None,
-        "Real_vs_Real_Wasserstein_Baseline": real_w_baseline,
+        "Wasserstein_Distance_mean": float(np.mean(all_w_gen)) if all_w_gen else None,
+        "Wasserstein_Distance_std": float(np.std(all_w_gen)) if all_w_gen else None,
+        "Real_vs_Real_Wasserstein_Baseline_mean": (
+            float(np.mean(all_w_base)) if all_w_base else None
+        ),
+        "Real_vs_Real_Wasserstein_Baseline_std": (
+            float(np.std(all_w_base)) if all_w_base else None
+        ),
         "SSIM_mean": float(np.nanmean(ssims)) if ssims else None,
         "SSIM_std": float(np.nanstd(ssims)) if ssims else None,
         "LPIPS_mean": float(np.mean(lpips_scores)) if lpips_scores else None,
         "LPIPS_std": float(np.std(lpips_scores)) if lpips_scores else None,
         "global_FID": float(global_fid) if global_fid is not None else None,
     }
+    metrics.update(stats_results)
+
     with open(outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
     print(json.dumps(metrics, indent=2))

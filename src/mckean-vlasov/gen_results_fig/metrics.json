@@ -2,18 +2,42 @@
   "counts": {
     "real": 1000,
     "fake": 512,
-    "pairs": 1024
+    "pairs": 512
   },
   "eval_mode": "best_slice",
   "Landscape_L2_Distance_mean": 64.66514139366684,
   "Landscape_L2_Distance_std": 9.703090118507166,
-  "Real_vs_Real_L2_Baseline": 40.298391366720196,
+  "Real_vs_Real_L2_Baseline_mean": 40.298391366720196,
+  "Real_vs_Real_L2_Baseline_std": 15.039747637759772,
   "Wasserstein_Distance_mean": 0.02947325983414653,
   "Wasserstein_Distance_std": 0.009830822848165728,
-  "Real_vs_Real_Wasserstein_Baseline": 0.015397248116393966,
-  "SSIM_mean": 0.7551713736047106,
+  "Real_vs_Real_Wasserstein_Baseline_mean": 0.015397248116393966,
+  "Real_vs_Real_Wasserstein_Baseline_std": 0.013338597658043556,
+  "SSIM_mean": 0.7551713736047105,
   "SSIM_std": 0.03360168527972275,
   "LPIPS_mean": 0.3013189254561439,
   "LPIPS_std": 0.06178230271287944,
-  "global_FID": 128.0667516269948
+  "global_FID": 128.0667516269948,
+  "L2_Distance_TOST": {
+    "test_type": "Non-Parametric Paired Equivalence Test (Wilcoxon-TOST)",
+    "null_hypothesis": "Difference is large (not equivalent)",
+    "alternative_hypothesis": "Difference is small (equivalent)",
+    "num_classes_paired": 8,
+    "equivalence_margin_ratio": 2.5,
+    "equivalence_margin_abs_diff": 60.447587050080294,
+    "median_difference": 25.95757970562213,
+    "tost_p_value": 0.00390625,
+    "is_equivalent": true
+  },
+  "Wasserstein_TOST": {
+    "test_type": "Non-Parametric Paired Equivalence Test (Wilcoxon-TOST)",
+    "null_hypothesis": "Difference is large (not equivalent)",
+    "alternative_hypothesis": "Difference is small (equivalent)",
+    "num_classes_paired": 8,
+    "equivalence_margin_ratio": 2.5,
+    "equivalence_margin_abs_diff": 0.02309587217459095,
+    "median_difference": 0.013033883553142975,
+    "tost_p_value": 0.00390625,
+    "is_equivalent": true
+  }
 }
